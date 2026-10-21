@@ -9,7 +9,7 @@
     window.rec_plugin_ready = true;
 
     var COMPONENT = 'rec_home';
-    var VERSION = '5.2.0';
+    var VERSION = '5.3.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -1055,8 +1055,12 @@
         this.start = function () {
             if (Lampa.Activity.active() && Lampa.Activity.active().activity !== this.activity) return;
 
+            headMode(true);
+
             Lampa.Controller.add('content', {
                 toggle: function () {
+                    // Вернулись из шапки — снова прячем её
+                    $('body').removeClass('rec--headpeek');
                     // Lampa снимает класс focus при уходе с экрана — восстанавливаем по сохранённому индексу
                     refreshCollection();
                     srcSchedule();
@@ -1071,8 +1075,10 @@
                     if (c && c.items && c.idx < c.items.length - 1) focusIdx(c.idx + 1);
                 },
                 up: function () {
-                    if (cur > 0) switchCat(-1);
-                    else Lampa.Controller.toggle('head');
+                    if (cur > 0) return switchCat(-1);
+                    // С верхней категории — показываем спрятанную шапку поверх экрана
+                    $('body').addClass('rec--headpeek');
+                    Lampa.Controller.toggle('head');
                 },
                 down: function () {
                     switchCat(1);
@@ -1097,15 +1103,38 @@
             return root;
         };
 
-        this.pause = function () {};
-        this.stop = function () {};
+        // Ушли на другой экран (карточка, Showy, главная) — шапка Lampa возвращается
+        this.pause = function () {
+            headMode(false);
+        };
+        this.stop = function () {
+            headMode(false);
+        };
 
         this.destroy = function () {
             destroyed = true;
             queue = [];
             clearTimeout(bgTimer);
+            headMode(false);
             root.remove();
         };
+    }
+
+    // ---------- Без верхней панели ----------
+    // Шапка Lampa (.head) закреплена сверху, а контент сдвинут под неё отступом .wrap__content.
+    // На «Подборках» убираем и то и другое — экран занимает всю высоту. ↑ на верхней категории
+    // выдвигает шапку поверх экрана (rec--headpeek), ↓ из шапки прячет её снова.
+
+    function headHiddenEnabled() {
+        var v = Lampa.Storage.get('rec_hide_head', true);
+        return !(v === false || v === 'false');
+    }
+
+    function headMode(on) {
+        var body = $('body');
+        body.removeClass('rec--headpeek');
+        body.toggleClass('rec--nohead', !!on && headHiddenEnabled());
+        if (Lampa.Layer && Lampa.Layer.update) Lampa.Layer.update();
     }
 
     // ---------- Подключение ----------
@@ -1154,7 +1183,13 @@
             '.rec-card.focus .rec-card__img{box-shadow:0 0 0 .18em #fff,0 .6em 1.5em rgba(0,0,0,.6)}' +
             '.rec-card--skeleton .rec-card__img{animation:recPulse 1.2s ease-in-out infinite}' +
             '@keyframes recPulse{50%{opacity:.45}}' +
-            '.rec-tv__empty{position:absolute;top:40%;left:0;right:0;text-align:center;opacity:.7;line-height:1.6}';
+            '.rec-tv__empty{position:absolute;top:40%;left:0;right:0;text-align:center;opacity:.7;line-height:1.6}' +
+            // Режим без шапки: шапка уезжает вверх, контент поднимается, экран — на всю высоту
+            'body.rec--nohead .head{transform:translateY(-110%);opacity:0;transition:transform .25s ease,opacity .25s ease}' +
+            'body.rec--nohead.rec--headpeek .head{transform:none;opacity:1}' +
+            'body.rec--nohead .wrap__content{padding-top:0 !important}' +
+            'body.rec--nohead .rec-tv{height:100vh !important}' +
+            'body.rec--nohead .rec-tv__hero{top:2.2em}';
 
         $('body').append('<style id="rec-plugin-style">' + css + '</style>');
     }
@@ -1172,6 +1207,15 @@
             field: {
                 name: 'Открывать «Подборки» при запуске Lampa',
                 description: 'Вместо главной Lampa. Главная остаётся в меню слева'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'rec_settings',
+            param: { name: 'rec_hide_head', type: 'trigger', default: true },
+            field: {
+                name: 'Скрывать верхнюю панель на «Подборках»',
+                description: 'Кнопка ↑ на верхней категории показывает её'
             }
         });
 
