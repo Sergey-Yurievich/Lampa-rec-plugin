@@ -9,7 +9,7 @@
     window.rec_plugin_ready = true;
 
     var COMPONENT = 'rec_home';
-    var VERSION = '5.0.0';
+    var VERSION = '5.2.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -30,10 +30,8 @@
 
     // ---------- Сеть TMDB ----------
 
-    // Свой ключ из настроек, иначе встроенный ключ Lampa
+    // Встроенный ключ TMDB самой Lampa — свой ключ вводить не нужно
     function apiKey() {
-        var own = (Lampa.Storage.get('rec_tmdb_key', '') + '').trim();
-        if (own) return own;
         return Lampa.TMDB && Lampa.TMDB.key ? Lampa.TMDB.key() : '';
     }
 
@@ -1168,6 +1166,15 @@
             icon: ICON
         });
 
+        Lampa.SettingsApi.addParam({
+            component: 'rec_settings',
+            param: { name: 'rec_start_screen', type: 'trigger', default: true },
+            field: {
+                name: 'Открывать «Подборки» при запуске Lampa',
+                description: 'Вместо главной Lampa. Главная остаётся в меню слева'
+            }
+        });
+
         // Выбор плагина для «Смотреть» из установленных онлайн-плагинов
         var values = { auto: 'Автоматически (Showy RU, если есть)' };
         videoPlugins().forEach(function (p) {
@@ -1201,21 +1208,38 @@
             }
         });
 
-        // values: '' обязателен для type: 'input' — без него Lampa падает при открытии раздела
-        Lampa.SettingsApi.addParam({
-            component: 'rec_settings',
-            param: {
-                name: 'rec_tmdb_key',
-                type: 'input',
-                values: '',
-                default: '',
-                placeholder: 'Не задан — используется ключ Lampa'
-            },
-            field: {
-                name: 'Свой TMDB API ключ (v3)',
-                description: 'Необязательно. Короткий ключ из themoviedb.org/settings/api'
-            }
+    }
+
+    // ---------- Автоустановка Showy RU ----------
+    // Если Showy RU нет — ставим его штатным механизмом Lampa (как через «Плагины» → «Добавить»).
+    // Только один раз: если пользователь потом удалит плагин сам, заново не навязываем.
+
+    var SHOWY_PLUGIN_URL = 'http://showypro.com/m.js';
+
+    function ensureShowy() {
+        if (Lampa.Storage.get('rec_showy_autoinstall_done', false)) return;
+
+        var list = [];
+        try {
+            list = Lampa.Plugins && Lampa.Plugins.get ? Lampa.Plugins.get() : (Lampa.Storage.get('plugins', '[]') || []);
+        } catch (e) {}
+
+        var listed = list.some(function (p) {
+            return String((p && p.url) || p).indexOf('showypro.com') >= 0;
         });
+
+        Lampa.Storage.set('rec_showy_autoinstall_done', true);
+
+        // Уже стоит: в списке плагинов или загружен иначе (например, из аккаунта CUB)
+        if (listed || showyInstalled()) return;
+
+        if (!Lampa.Plugins || !Lampa.Plugins.add) {
+            console.log('[rec]', 'Plugins API недоступен, Showy RU не установлен');
+            return;
+        }
+
+        Lampa.Plugins.add({ url: SHOWY_PLUGIN_URL, status: 1, name: 'Showy RU' });
+        Lampa.Noty.show('Подборки: установлен плагин Showy RU для просмотра');
     }
 
     function addMenu() {
@@ -1231,11 +1255,41 @@
             Lampa.Listener.follow('full', onFullReady);
             addSettings();
             addMenu();
+            // Даём уже установленным плагинам зарегистрироваться (Showy делает это в течение ~3 с)
+            setTimeout(function () {
+                try { ensureShowy(); } catch (e) { console.log('[rec]', 'showy install error', e); }
+            }, 4000);
             console.log('[rec]', 'loaded', VERSION);
         } catch (e) {
             console.log('[rec]', 'init error', e);
             if (Lampa.Noty) Lampa.Noty.show('Подборки: ошибка запуска — ' + e.message);
         }
+    }
+
+    // ---------- Стартовый экран ----------
+    // Lampa сначала загружает плагины, а первый экран открывает через 0.5 с после старта
+    // (Activity.init → setTimeout(last)). Если до этого задать window.start_deep_link,
+    // Lampa откроет его вместо главной — так «Подборки» становятся стартовым экраном.
+
+    function startScreenEnabled() {
+        var v = Lampa.Storage.get('rec_start_screen', true);
+        return !(v === false || v === 'false');
+    }
+
+    function setStartScreen() {
+        if (window.appready || window.start_deep_link) return;     // Lampa уже запущена или открывают ссылку
+        if (/[?&](card|component)=/.test(window.location.search || '')) return; // прямая ссылка в адресе
+        if (!startScreenEnabled()) return;
+
+        // Компонент регистрируем сразу: экран откроется раньше, чем сработает init()
+        Lampa.Component.add(COMPONENT, Component);
+        window.start_deep_link = { url: '', title: 'Подборки', component: COMPONENT, page: 1 };
+    }
+
+    try {
+        setStartScreen();
+    } catch (e) {
+        console.log('[rec]', 'start screen error', e);
     }
 
     if (window.appready) init();
