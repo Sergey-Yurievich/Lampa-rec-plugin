@@ -3,13 +3,13 @@
 
     // Lampa «Подборки» v4 — главная в стиле Apple TV / Netflix
     // Сверено с исходниками yumata/lampa-source (Lampa 3.x) и проверено на lampa.mx
-    // Пульт: ←/→ — фильмы, ↑/↓ — категории, OK — смотреть, долгий OK — карточка Lampa
+    // Пульт: ←/→ — фильмы, ↑/↓ — категории, OK / тап по постеру — смотреть, долгий OK — карточка Lampa
 
     if (window.rec_plugin_ready) return;
     window.rec_plugin_ready = true;
 
     var COMPONENT = 'rec_home';
-    var VERSION = '4.0.0';
+    var VERSION = '4.1.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -221,13 +221,41 @@
         return list[0] || null;
     }
 
+    // Запасной путь: открыть карточку Lampa и нажать в ней кнопку онлайн-плагина
+    // (Showy RU и похожие плагины добавляют её в карточку по событию 'full')
+    var pendingWatch = null;
+
+    function watchViaCard(m) {
+        pendingWatch = { id: m.id, time: Date.now() };
+        openCard(m);
+    }
+
+    function onFullReady(e) {
+        if (e.type !== 'complite' || !pendingWatch) return;
+
+        var movie = e.data && e.data.movie;
+        if (!movie || movie.id != pendingWatch.id || Date.now() - pendingWatch.time > 20000) return;
+
+        pendingWatch = null;
+
+        // Плагины вставляют кнопку в тот же обработчик 'complite' — даём им отработать
+        setTimeout(function () {
+            var render = e.object && e.object.activity ? e.object.activity.render() : $();
+            var btn = render.find('.showy-ru-showy60--button, [class*="view--online"]').first();
+
+            if (btn.length) {
+                if (Lampa.Utils && Lampa.Utils.trigger) Lampa.Utils.trigger(btn[0], 'hover:enter');
+                else btn.trigger('hover:enter');
+            } else {
+                Lampa.Noty.show('Кнопка онлайн-плагина не найдена в карточке');
+            }
+        }, 300);
+    }
+
     function watch(m) {
         var plugin = findVideoPlugin();
 
-        if (!plugin) {
-            Lampa.Noty.show('Плагин просмотра не найден — открываю карточку');
-            return openCard(m);
-        }
+        if (!plugin) return watchViaCard(m);
 
         var data = cardData(m);
         var cancelled = false;
@@ -267,8 +295,51 @@
         return d.getFullYear() + '-' + (mm < 10 ? '0' : '') + mm + '-' + (dd < 10 ? '0' : '') + dd;
     }
 
+    // Аниме: японская/китайская/корейская анимация — убираем из всех подборок
+    function isAnime(m) {
+        var anim = (m.genre_ids || []).indexOf(16) >= 0;
+        var lang = m.original_language;
+        var asia = lang === 'ja' || lang === 'zh' || lang === 'ko' || lang === 'cn';
+        var jp = (m.origin_country || []).indexOf('JP') >= 0;
+        return anim && (asia || jp);
+    }
+
+    function clean(items) {
+        return items.filter(function (m) {
+            if (!m || !m.poster_path || isAnime(m)) return false;
+            if (m.media_type && m.media_type !== 'movie' && m.media_type !== 'tv') return false;
+            return true;
+        });
+    }
+
+    function copy(o) {
+        var r = {};
+        for (var k in o) r[k] = o[k];
+        return r;
+    }
+
+    // Источник ряда: если после фильтров мало фильмов — догружаем вторую страницу
+    function source(path, params, filter) {
+        params = params || {};
+        return function (cb) {
+            tmdb(path, params, function (a) {
+                a = clean(a);
+                if (filter) a = a.filter(filter);
+                if (a.length >= 12) return cb(a);
+
+                var p2 = copy(params);
+                p2.page = 2;
+                tmdb(path, p2, function (b) {
+                    b = clean(b);
+                    if (filter) b = b.filter(filter);
+                    cb(a.concat(b));
+                });
+            });
+        };
+    }
+
     function discover(params) {
-        return function (cb) { tmdb('discover/movie', params, cb); };
+        return source('discover/movie', params);
     }
 
     // Подборка по времени года: основной запрос + запасной, если основной пустой
@@ -336,33 +407,20 @@
             var method = isTv(card) ? 'tv' : 'movie';
             cats.push({
                 title: 'Потому что вы смотрели «' + (card.title || card.name) + '»',
-                load: function (cb) {
-                    tmdb(method + '/' + card.id + '/recommendations', {}, function (items) {
-                        cb(items.filter(function (m) { return !seen[m.id]; }));
-                    });
-                }
+                load: source(method + '/' + card.id + '/recommendations', {}, function (m) { return !seen[m.id]; })
             });
         });
 
-        cats.push({
-            title: 'Тренды недели',
-            load: function (cb) {
-                tmdb('trending/all/week', {}, function (items) {
-                    cb(items.filter(function (m) { return m.media_type === 'movie' || m.media_type === 'tv'; }));
-                });
-            }
-        });
+        // Тренды отдельно для кино и сериалов
+        cats.push({ title: 'Тренды недели: кино', load: source('trending/movie/week') });
+        cats.push({ title: 'Тренды недели: сериалы', load: source('trending/tv/week') });
 
         // Новинки
-        cats.push({ title: 'Сейчас в кино', load: function (cb) { tmdb('movie/now_playing', {}, cb); } });
+        cats.push({ title: 'Сейчас в кино', load: source('movie/now_playing') });
+        // movie/upcoming отдаёт и уже вышедшие фильмы, поэтому берём discover с датой от сегодня
         cats.push({
             title: 'Скоро в кино',
-            load: function (cb) {
-                var d = today();
-                tmdb('movie/upcoming', {}, function (items) {
-                    cb(items.filter(function (m) { return (m.release_date || '') >= d; }));
-                });
-            }
+            load: discover({ 'primary_release_date.gte': today(), sort_by: 'popularity.desc' })
         });
 
         cats.push(seasonCategory());
@@ -377,10 +435,9 @@
             }
         });
 
-        // Сериалы
-        cats.push({ title: 'Сериалы: в тренде', load: function (cb) { tmdb('trending/tv/week', {}, cb); } });
-        cats.push({ title: 'Сериалы: сейчас в эфире', load: function (cb) { tmdb('tv/on_the_air', {}, cb); } });
-        cats.push({ title: 'Сериалы: лучшие по рейтингу', load: function (cb) { tmdb('tv/top_rated', {}, cb); } });
+        // Сериалы (тренды сериалов — выше, отдельным рядом)
+        cats.push({ title: 'Сериалы: сейчас в эфире', load: source('tv/on_the_air') });
+        cats.push({ title: 'Сериалы: лучшие по рейтингу', load: source('tv/top_rated') });
 
         // Жанры
         [
@@ -393,7 +450,7 @@
             });
         });
 
-        cats.push({ title: 'Лучшие фильмы всех времён', load: function (cb) { tmdb('movie/top_rated', {}, cb); } });
+        cats.push({ title: 'Лучшие фильмы всех времён', load: source('movie/top_rated') });
 
         cats.forEach(function (c) {
             c.items = null;
@@ -414,8 +471,8 @@
         cat.loading = true;
         cat.load(function (items) {
             var ids = {};
-            cat.items = items.filter(function (m) {
-                if (!m.poster_path || ids[m.id]) return false;
+            cat.items = clean(items).filter(function (m) {
+                if (ids[m.id]) return false;
                 ids[m.id] = true;
                 return true;
             }).slice(0, 20);
@@ -444,7 +501,7 @@
                     '<div class="rec-tv__title"></div>' +
                     '<div class="rec-tv__meta"></div>' +
                     '<div class="rec-tv__overview"></div>' +
-                    '<div class="rec-tv__hint"><b>OK</b> смотреть &nbsp;·&nbsp; <b>удерживайте OK</b> подробнее</div>' +
+                    '<div class="rec-tv__hint">Нажмите на постер, чтобы смотреть</div>' +
                 '</div>' +
                 '<div class="rec-tv__rows">' +
                     '<div class="rec-tv__prev selector"></div>' +
@@ -656,8 +713,13 @@
             Lampa.Controller.add('content', {
                 toggle: function () {
                     Lampa.Controller.collectionSet(root);
-                    var el = track.children('.rec-card.focus')[0];
-                    if (el) Lampa.Controller.collectionFocus(el, root);
+                    // Lampa снимает класс focus при уходе с экрана — восстанавливаем по сохранённому индексу
+                    var c = cats[cur];
+                    var el = c && c.items ? track.children('.rec-card').eq(c.idx)[0] : null;
+                    if (el) {
+                        Lampa.Controller.collectionFocus(el, root);
+                        focusIdx(c.idx);
+                    }
                 },
                 left: function () {
                     var c = cats[cur];
@@ -726,24 +788,27 @@
             '.rec-tv__meta span{margin-right:1.1em;opacity:.9}' +
             '.rec-tv__rate{color:#ffd54a;font-weight:700;opacity:1 !important}' +
             '.rec-tv__overview{line-height:1.45;opacity:.85;max-width:36em;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}' +
-            '.rec-tv__hint{margin-top:1.1em;font-size:.8em;opacity:.55}' +
-            '.rec-tv__hint b{display:inline-block;padding:.05em .45em;border:1px solid rgba(255,255,255,.55);border-radius:.3em;font-weight:600}' +
+            '.rec-tv__hint{margin-top:1.1em;font-size:.8em;opacity:.5}' +
             '.rec-tv__rows{position:absolute;left:0;right:0;bottom:.6em}' +
             '.rec-tv__rows--down{animation:recInDown .3s ease}' +
             '.rec-tv__rows--up{animation:recInUp .3s ease}' +
             '@keyframes recInDown{from{opacity:0;transform:translateY(1.5em)}to{opacity:1;transform:none}}' +
             '@keyframes recInUp{from{opacity:0;transform:translateY(-1.5em)}to{opacity:1;transform:none}}' +
             '.rec-tv__prev,.rec-tv__next{margin-left:3.4em;font-size:.85em;opacity:.45;padding:.25em 0;display:inline-block}' +
+            '.rec-tv__prev{margin-bottom:.4em}' +
             '.rec-tv__prev.focus,.rec-tv__next.focus{opacity:.9}' +
-            '.rec-tv__cat{margin:.2em 0 0 3em;font-size:1.35em;font-weight:600;display:flex;align-items:baseline}' +
+            // 2.22em × 1.35 = 3em — заголовок ровно над левым краем карточек
+            '.rec-tv__cat{margin:.2em 0 0 2.22em;font-size:1.35em;font-weight:600;display:flex;align-items:baseline}' +
             '.rec-tv__count{font-size:.6em;opacity:.45;margin-left:.9em;font-weight:400}' +
-            '.rec-tv__line{overflow:hidden;padding:.9em 0 .9em 3em}' +
+            // Отступы под увеличенную карточку: сверху от заголовка и снизу до подписи следующей категории
+            '.rec-tv__line{overflow:hidden;padding:2em 0 1.8em 3em}' +
             '.rec-tv__track{display:flex;transition:transform .3s ease;will-change:transform}' +
-            '.rec-card{position:relative;flex:0 0 auto;width:8.6em;margin-right:1.1em;transition:transform .2s ease}' +
+            '.rec-card{position:relative;flex:0 0 auto;width:8.4em;margin-right:1.1em;transition:transform .2s ease,margin .2s ease;transform-origin:left center}' +
             '.rec-card__img{padding-top:150%;position:relative;border-radius:.6em;overflow:hidden;background:rgba(255,255,255,.08)}' +
             '.rec-card__img img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .3s}' +
             '.rec-card__img img.loaded{opacity:1}' +
-            '.rec-card.focus{transform:scale(1.1)}' +
+            // Выбранная карточка крупнее; доп. отступ справа, чтобы не наезжала на соседнюю
+            '.rec-card.focus{transform:scale(1.22);margin-right:3em}' +
             '.rec-card.focus .rec-card__img{box-shadow:0 0 0 .18em #fff,0 .6em 1.5em rgba(0,0,0,.6)}' +
             '.rec-card--skeleton .rec-card__img{animation:recPulse 1.2s ease-in-out infinite}' +
             '@keyframes recPulse{50%{opacity:.45}}' +
@@ -798,6 +863,7 @@
         try {
             addStyles();
             Lampa.Component.add(COMPONENT, Component);
+            Lampa.Listener.follow('full', onFullReady);
             addSettings();
             addMenu();
             console.log('[rec]', 'loaded', VERSION);
