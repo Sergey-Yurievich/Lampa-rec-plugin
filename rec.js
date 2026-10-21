@@ -643,9 +643,6 @@
             title: 'Премьеры сериалов этого месяца',
             load: discoverTv({ 'first_air_date.gte': dateShift(-30), 'first_air_date.lte': dateShift(0), sort_by: 'popularity.desc' })
         });
-        cats.push({ title: 'Сейчас в кино', load: source('movie/now_playing') });
-        cats.push({ title: 'Скоро в кино', load: discover({ 'primary_release_date.gte': dateShift(0), sort_by: 'popularity.desc' }) });
-
         cats.push(seasonCategory());
 
         // --- Платформы ---
@@ -676,17 +673,6 @@
         });
         cats.push({ title: 'Сериалы: лучшие по рейтингу', load: source('tv/top_rated') });
         cats.push({ title: 'Для всей семьи', load: discover({ with_genres: 10751, sort_by: 'popularity.desc', 'vote_count.gte': 300 }) });
-
-        // --- Жанры ---
-        [
-            ['Боевики', 28], ['Фантастика', 878], ['Комедии', 35], ['Триллеры', 53],
-            ['Ужасы', 27], ['Драмы', 18], ['Детективы', 9648]
-        ].forEach(function (g) {
-            cats.push({
-                title: g[0],
-                load: discover({ with_genres: g[1], sort_by: 'popularity.desc', 'vote_count.gte': 300 })
-            });
-        });
 
         // --- Классика ---
         cats.push({
@@ -785,6 +771,21 @@
         function current() {
             var c = cats[cur];
             return c && c.items ? c.items[c.idx] : null;
+        }
+
+        // Lampa.Controller.collectionSet снимает класс focus со всех элементов —
+        // после него сразу возвращаем подсветку на выбранную карточку
+        function refreshCollection() {
+            if (!isActive()) return;
+
+            Lampa.Controller.collectionSet(root);
+
+            var c = cats[cur];
+            if (!c || !c.items || !c.items.length) return;
+
+            var el = track.children('.rec-card').eq(c.idx)[0];
+            if (el) Lampa.Controller.collectionFocus(el, root);
+            focusIdx(c.idx, true);
         }
 
         // Фон меняем с задержкой, чтобы при быстром листании не грузить каждую картинку
@@ -905,7 +906,7 @@
             if (i < c.idx) c.idx--;
             focusIdx(Math.min(c.idx, c.items.length - 1), true);
 
-            if (isActive()) Lampa.Controller.collectionSet(root);
+            refreshCollection();
         }
 
         // --- Навигация ---
@@ -1032,7 +1033,7 @@
             focusIdx(c.idx);
 
             if (_this.activity) _this.activity.loader(false);
-            if (isActive()) Lampa.Controller.collectionSet(root);
+            refreshCollection();
 
             prefetch();
         }
@@ -1058,14 +1059,9 @@
 
             Lampa.Controller.add('content', {
                 toggle: function () {
-                    Lampa.Controller.collectionSet(root);
                     // Lampa снимает класс focus при уходе с экрана — восстанавливаем по сохранённому индексу
-                    var c = cats[cur];
-                    var el = c && c.items ? track.children('.rec-card').eq(c.idx)[0] : null;
-                    if (el) {
-                        Lampa.Controller.collectionFocus(el, root);
-                        focusIdx(c.idx);
-                    }
+                    refreshCollection();
+                    srcSchedule();
                 },
                 left: function () {
                     var c = cats[cur];
