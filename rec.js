@@ -1,14 +1,14 @@
 (function () {
     'use strict';
 
-    // Lampa «Подборки» v2
-    // Сверено с исходниками yumata/lampa-source (Lampa 3.x)
+    // Lampa «Подборки» v3
+    // Сверено с исходниками yumata/lampa-source (Lampa 3.x) и проверено на lampa.mx
 
     if (window.rec_plugin_ready) return;
     window.rec_plugin_ready = true;
 
     var COMPONENT = 'rec_home';
-    var VERSION = '2.0.0';
+    var VERSION = '3.0.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -24,15 +24,55 @@
         return Lampa.TMDB && Lampa.TMDB.key ? Lampa.TMDB.key() : '';
     }
 
-    // Lampa.TMDB.api / image учитывают прокси TMDB из настроек Lampa
-    function apiUrl(path) {
-        return Lampa.TMDB && Lampa.TMDB.api ? Lampa.TMDB.api(path) : 'https://api.themoviedb.org/3/' + path;
+    function cubDomain() {
+        return (Lampa.Manifest && Lampa.Manifest.cub_domain) || 'cub.best';
     }
 
-    function imgUrl(path) {
-        var p = 't/p/w342' + path;
-        return Lampa.TMDB && Lampa.TMDB.image ? Lampa.TMDB.image(p) : 'https://image.tmdb.org/' + p;
+    function addQuery(u, q) {
+        return u + (u.indexOf('?') >= 0 ? '&' : '?') + q;
     }
+
+    function isDirectTmdb(u) {
+        return /\/\/(api|image)\.(themoviedb|tmdb)\.org\//.test(u);
+    }
+
+    // Прямой TMDB из России недоступен, поэтому порядок такой:
+    // 1) прокси из настроек Lampa (если задан), 2) прокси CUB, 3) прямой TMDB
+    function apiCandidates(path) {
+        var list = [];
+        if (Lampa.TMDB && Lampa.TMDB.api) {
+            var own = Lampa.TMDB.api(path);
+            if (!isDirectTmdb(own)) list.push(own);
+        }
+        list.push('https://apitmdb.' + cubDomain() + '/3/' + path);
+        list.push('https://api.themoviedb.org/3/' + path);
+        return list;
+    }
+
+    function imgCandidates(path) {
+        var p = 't/p/w342/' + path.replace(/^\//, '');
+        var list = [];
+        if (Lampa.TMDB && Lampa.TMDB.image) {
+            var own = Lampa.TMDB.image(p);
+            if (!isDirectTmdb(own)) list.push(own);
+        }
+        list.push('https://imagetmdb.com/' + p);
+        list.push('https://imagetmdb.' + cubDomain() + '/' + p);
+        list.push('https://nl.imagetmdb.com/' + p);
+        list.push('https://image.tmdb.org/' + p);
+        return list;
+    }
+
+    // Источник для открытия карточки: 'tmdb' грузит её напрямую с TMDB (в РФ зависает),
+    // 'cub' — через сервер Lampa. tmdb берём, только если в Lampa настроен свой прокси TMDB
+    function cardSource() {
+        if (Lampa.TMDB && Lampa.TMDB.api && !isDirectTmdb(Lampa.TMDB.api('movie/1'))) return 'tmdb';
+        return 'cub';
+    }
+
+    // Запоминаем, какой вариант сработал, чтобы не перебирать каждый раз
+    var goodApi = 0;
+    var goodImg = 0;
 
     function tmdb(path, params, cb) {
         var q = ['api_key=' + encodeURIComponent(apiKey()), 'language=ru-RU'];
@@ -40,15 +80,42 @@
             q.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k]));
         });
 
-        var url = apiUrl(path) + (path.indexOf('?') >= 0 ? '&' : '?') + q.join('&');
+        var urls = apiCandidates(path);
+        var order = [goodApi].concat(urls.map(function (u, i) { return i; }).filter(function (i) { return i !== goodApi; }));
 
-        fetch(url)
-            .then(function (r) { return r.json(); })
-            .then(function (j) { cb(j && j.results ? j.results : []); })
-            .catch(function (e) {
-                console.log('[rec]', 'tmdb error', path, e);
-                cb([]);
+        function attempt(n) {
+            if (n >= order.length) {
+                console.log('[rec]', 'tmdb failed', path);
+                return cb([]);
+            }
+
+            var idx = order[n];
+            var net = new Lampa.Reguest();
+            net.timeout(8000);
+            net.silent(addQuery(urls[idx], q.join('&')), function (j) {
+                goodApi = idx;
+                cb(j && j.results ? j.results : []);
+            }, function () {
+                attempt(n + 1);
             });
+        }
+
+        attempt(0);
+    }
+
+    // Картинка с перебором зеркал при ошибке
+    function setPoster(img, path) {
+        var urls = imgCandidates(path);
+        var order = [goodImg].concat(urls.map(function (u, i) { return i; }).filter(function (i) { return i !== goodImg; }));
+        var n = 0;
+
+        img.onload = function () { goodImg = order[n]; };
+        img.onerror = function () {
+            n++;
+            if (n < order.length) img.src = urls[order[n]];
+            else img.remove();
+        };
+        img.src = urls[order[0]];
     }
 
     // ---------- История ----------
@@ -146,7 +213,7 @@
                 id: m.id,
                 method: isTv(m) ? 'tv' : 'movie',
                 card: m,
-                source: 'tmdb'
+                source: cardSource()
             });
         }
 
@@ -162,9 +229,7 @@
                 '<div class="rec-card__year"></div>' +
                 '</div>');
 
-            card.find('img').attr('src', imgUrl(m.poster_path)).on('error', function () {
-                $(this).remove();
-            });
+            setPoster(card.find('img')[0], m.poster_path);
             card.find('.rec-card__title').text(title);
             card.find('.rec-card__year').text(year);
             card.find('.rec-card__vote').text(vote);
