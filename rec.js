@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    // Lampa «Подборки» v5 — главная в стиле Apple TV / Netflix
+    // Lampa «Подборки» v6 — главная в стиле Apple TV / Netflix: логотипы, трейлеры на фоне, мгновенный старт из кэша
     // Сверено с исходниками yumata/lampa-source (Lampa 3.x) и проверено на lampa.mx
     // Пульт: ←/→ — фильмы, ↑/↓ — категории, OK / тап по постеру — смотреть, долгий OK — карточка Lampa
 
@@ -9,7 +9,7 @@
     window.rec_plugin_ready = true;
 
     var COMPONENT = 'rec_home';
-    var VERSION = '5.3.0';
+    var VERSION = '6.0.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -473,13 +473,201 @@
         return anim && (asia || jp);
     }
 
+    // Досмотренное и брошенное (списки Lampa «Просмотрено» и «Брошено») не показываем в общих рядах.
+    // Обновляется при каждом открытии «Подборок»
+    var watchedIds = {};
+
+    function refreshWatched() {
+        watchedIds = {};
+        favorites('viewed').concat(favorites('thrown')).forEach(function (c) {
+            watchedIds[c.id] = true;
+        });
+    }
+
     function clean(items) {
         return items.filter(function (m) {
             if (!m || !m.poster_path || isAnime(m)) return false;
             if (m.media_type && m.media_type !== 'movie' && m.media_type !== 'tv') return false;
+            if (watchedIds[m.id]) return false;
             if (srcGet(m) === false) return false; // уже знаем, что в Showy RU источников нет
             return true;
         });
+    }
+
+    // ---------- Детали фильма: логотип, длительность, возраст, трейлер ----------
+    // Один запрос на фильм (append_to_response), результат держим в памяти
+
+    var details = {};
+    var logoUrls = {};   // путь логотипа → адрес, с которого он уже загрузился
+
+    // Американские рейтинги — к привычным российским
+    var AGE_US = {
+        'G': '0+', 'PG': '6+', 'PG-13': '12+', 'R': '18+', 'NC-17': '18+',
+        'TV-Y': '0+', 'TV-G': '0+', 'TV-Y7': '6+', 'TV-PG': '12+', 'TV-14': '16+', 'TV-MA': '18+'
+    };
+
+    function mediaKey(m) {
+        return (isTv(m) ? 'tv' : 'movie') + '_' + m.id;
+    }
+
+    function parseDetails(j, tv) {
+        var r = { runtime: 0, seasons: 0, age: '', logo: '', trailer: '', lastEp: '', nextEp: '' };
+        var i;
+
+        if (tv) {
+            r.seasons = j.number_of_seasons || 0;
+            r.runtime = (j.episode_run_time || [])[0] || 0;
+            r.lastEp = (j.last_episode_to_air && j.last_episode_to_air.air_date) || '';
+            r.nextEp = (j.next_episode_to_air && j.next_episode_to_air.air_date) || '';
+        } else {
+            r.runtime = j.runtime || 0;
+        }
+
+        // Возраст: сначала Россия, потом США с переводом
+        var ru = '', us = '';
+        if (tv) {
+            ((j.content_ratings && j.content_ratings.results) || []).forEach(function (c) {
+                if (c.iso_3166_1 === 'RU' && c.rating) ru = c.rating;
+                if (c.iso_3166_1 === 'US' && c.rating) us = c.rating;
+            });
+        } else {
+            ((j.release_dates && j.release_dates.results) || []).forEach(function (c) {
+                (c.release_dates || []).forEach(function (d) {
+                    if (!d.certification) return;
+                    if (c.iso_3166_1 === 'RU' && !ru) ru = d.certification;
+                    if (c.iso_3166_1 === 'US' && !us) us = d.certification;
+                });
+            });
+        }
+        if (ru) r.age = /\+$/.test(ru) ? ru : ru + '+';
+        else if (us) r.age = AGE_US[us] || '';
+
+        // Логотип: русский, иначе английский
+        var logos = (j.images && j.images.logos) || [];
+        var pickLogo = function (lang) {
+            for (i = 0; i < logos.length; i++) if (logos[i].iso_639_1 === lang && logos[i].file_path) return logos[i].file_path;
+            return '';
+        };
+        r.logo = pickLogo('ru') || pickLogo('en');
+
+        // Трейлер с YouTube: русский трейлер → русский тизер → английский трейлер → английский тизер
+        var vids = ((j.videos && j.videos.results) || []).filter(function (v) {
+            return v.site === 'YouTube' && v.key && (v.type === 'Trailer' || v.type === 'Teaser');
+        });
+        var pickVideo = function (lang, type) {
+            for (i = 0; i < vids.length; i++) if (vids[i].iso_639_1 === lang && vids[i].type === type) return vids[i].key;
+            return '';
+        };
+        r.trailer = pickVideo('ru', 'Trailer') || pickVideo('ru', 'Teaser') || pickVideo('en', 'Trailer') ||
+            pickVideo('en', 'Teaser') || (vids[0] ? vids[0].key : '');
+
+        return r;
+    }
+
+    // Детали помним между запусками: логотип и длительность видны сразу, без запроса
+    var DET_KEY = 'rec_details_v1';
+    var DET_TTL = 2 * 24 * 3600 * 1000;
+    var DET_MAX = 400;
+    var detStore = null;
+    var detSaveTimer;
+
+    function detLoad() {
+        if (detStore) return detStore;
+        try {
+            detStore = JSON.parse(window.localStorage.getItem(DET_KEY) || '{}') || {};
+        } catch (e) {
+            detStore = {};
+        }
+        return detStore;
+    }
+
+    function detSave() {
+        clearTimeout(detSaveTimer);
+        detSaveTimer = setTimeout(function () {
+            var s = detLoad();
+            var now = Date.now();
+            var keys = Object.keys(s).filter(function (k) {
+                if (now - s[k].t > DET_TTL) { delete s[k]; return false; }
+                return true;
+            });
+            // Самые старые выкидываем, если записей слишком много
+            if (keys.length > DET_MAX) {
+                keys.sort(function (a, b) { return s[a].t - s[b].t; });
+                keys.slice(0, keys.length - DET_MAX).forEach(function (k) { delete s[k]; });
+            }
+            try {
+                window.localStorage.setItem(DET_KEY, JSON.stringify(s));
+            } catch (e) {
+                console.log('[rec]', 'details cache full', e);
+            }
+        }, 2000);
+    }
+
+    // Детали без запроса: из памяти или из сохранённого кэша (null — пока неизвестны)
+    function knownDetails(m) {
+        var k = mediaKey(m);
+        var d = details[k];
+        if (d && d.ready) return d.data;
+        if (d) return null;
+
+        var s = detLoad()[k];
+        if (s && Date.now() - s.t < DET_TTL) {
+            details[k] = { ready: true, data: s.d, cbs: [] };
+            return s.d;
+        }
+        return null;
+    }
+
+    function getDetails(m, cb) {
+        var k = mediaKey(m);
+        var known = knownDetails(m);
+        if (known) return cb(known);
+
+        var d = details[k];
+        if (d && d.ready) return cb(d.data);
+        if (d) return d.cbs.push(cb);
+
+        d = details[k] = { ready: false, data: null, cbs: [cb] };
+
+        var tv = isTv(m);
+        tmdbJson((tv ? 'tv/' : 'movie/') + m.id, {
+            append_to_response: tv ? 'images,content_ratings,videos' : 'images,release_dates,videos',
+            include_image_language: 'ru,en,null',
+            include_video_language: 'ru,en'
+        }, function (j) {
+            var data = j && j.id ? parseDetails(j, tv) : null;
+            var cbs = d.cbs;
+
+            if (data) {
+                d.ready = true;
+                d.data = data;
+                detLoad()[k] = { t: Date.now(), d: data };
+                detSave();
+            } else {
+                // Сеть подвела — в следующий раз попробуем снова
+                delete details[k];
+            }
+
+            cbs.forEach(function (f) { f(data); });
+        });
+    }
+
+    function plural(n, one, few, many) {
+        var a = n % 10, b = n % 100;
+        if (a === 1 && b !== 11) return one;
+        if (a >= 2 && a <= 4 && (b < 12 || b > 14)) return few;
+        return many;
+    }
+
+    function formatRuntime(min) {
+        if (!min) return '';
+        var h = Math.floor(min / 60), mm = min % 60;
+        return h ? h + ' ч' + (mm ? ' ' + mm + ' мин' : '') : mm + ' мин';
+    }
+
+    // Вышла ли серия за последние 7 дней
+    function freshEpisode(d) {
+        return !!(d && d.lastEp && d.lastEp >= dateShift(-7) && d.lastEp <= dateShift(0));
     }
 
     // Источник ряда: если после фильтров мало фильмов — догружаем вторую страницу
@@ -540,15 +728,6 @@
         return favorites('history').filter(function (c) { return ok[c.id]; });
     }
 
-    function bookmarksList() {
-        var seen = {};
-        return favorites('book').concat(favorites('wath'), favorites('like')).filter(function (c) {
-            if (seen[c.id]) return false;
-            seen[c.id] = true;
-            return true;
-        });
-    }
-
     // Подборка по времени года: основной запрос + запасной, если основной пустой
     function seasonCategory() {
         var month = new Date().getMonth();
@@ -602,26 +781,53 @@
         };
     }
 
+    // Один ряд рекомендаций по последним 5 тайтлам из истории: списки перемешиваем по очереди
+    // (1-й от каждого, потом 2-й…), чтобы ряд не состоял из похожих на один фильм
+    function historyRecommendations(hist, seen) {
+        return function (cb) {
+            var srcs = hist.slice(0, 5);
+            var lists = [];
+            var pending = srcs.length;
+
+            if (!pending) return cb([]);
+
+            srcs.forEach(function (card, i) {
+                tmdb((isTv(card) ? 'tv' : 'movie') + '/' + card.id + '/recommendations', {}, function (items) {
+                    lists[i] = clean(items).filter(function (m) { return !seen[m.id]; });
+                    if (--pending) return;
+
+                    var out = [];
+                    var ids = {};
+                    for (var r = 0; r < 20; r++) {
+                        for (var l = 0; l < lists.length; l++) {
+                            var m = lists[l] && lists[l][r];
+                            if (m && !ids[m.id]) {
+                                ids[m.id] = true;
+                                out.push(m);
+                            }
+                        }
+                    }
+                    cb(out);
+                });
+            });
+        };
+    }
+
     function buildCategories() {
         var cats = [];
         var hist = favorites('history');
         var seen = {};
         var year = new Date().getFullYear();
 
+        refreshWatched();
         hist.forEach(function (c) { seen[c.id] = true; });
 
         // --- Личное ---
         cats.push(personal('Продолжить просмотр', continueList));
-        cats.push(personal('Ваши закладки', bookmarksList));
 
-        // «Потому что вы смотрели …» по трём последним тайтлам
-        hist.slice(0, 3).forEach(function (card) {
-            var method = isTv(card) ? 'tv' : 'movie';
-            cats.push({
-                title: 'Потому что вы смотрели «' + (card.title || card.name) + '»',
-                load: source(method + '/' + card.id + '/recommendations', {}, function (m) { return !seen[m.id]; })
-            });
-        });
+        if (hist.length) {
+            cats.push({ title: 'На основе того, что вы смотрели', load: historyRecommendations(hist, seen) });
+        }
 
         // --- Актуальное ---
         cats.push({ title: 'Тренды недели: кино', load: source('trending/movie/week') });
@@ -633,20 +839,43 @@
                 'release_date.gte': dateShift(-60),
                 'release_date.lte': dateShift(0),
                 sort_by: 'popularity.desc',
-                'vote_count.gte': 20
+                'vote_count.gte': 50,
+                'vote_average.gte': 6   // без провалов
             })
         });
-        cats.push({ title: 'Новые серии на этой неделе', load: source('tv/on_the_air') });
+        // Серии ±7 дней. Без сериалов старше 6 лет («Закон и порядок», «Симпсоны» выходят каждую неделю
+        // и забивали ряд), без ток-шоу/реалити и без малоизвестного (от 100 голосов)
+        cats.push({
+            title: 'Новые серии на этой неделе',
+            load: discoverTv({
+                'air_date.gte': dateShift(-7),
+                'air_date.lte': dateShift(7),
+                'first_air_date.gte': dateShift(-365 * 6),
+                'vote_count.gte': 100,
+                sort_by: 'popularity.desc'
+            })
+        });
         cats.push({
             title: 'Премьеры сериалов этого месяца',
-            load: discoverTv({ 'first_air_date.gte': dateShift(-30), 'first_air_date.lte': dateShift(0), sort_by: 'popularity.desc' })
+            // от 30 голосов — без никому не известных сериалов с рейтингом 9.0 от одного голоса
+            load: discoverTv({ 'first_air_date.gte': dateShift(-30), 'first_air_date.lte': dateShift(0), 'vote_count.gte': 30, sort_by: 'popularity.desc' })
         });
         cats.push(seasonCategory());
 
-        // --- Платформы ---
-        cats.push({ title: 'Сериалы Netflix', load: discoverTv({ with_networks: 213, sort_by: 'popularity.desc', 'vote_count.gte': 100 }) });
-        cats.push({ title: 'Сериалы HBO', load: discoverTv({ with_networks: 49, sort_by: 'popularity.desc', 'vote_count.gte': 100 }) });
-        cats.push({ title: 'Сериалы Apple TV+', load: discoverTv({ with_networks: 2552, sort_by: 'popularity.desc', 'vote_count.gte': 50 }) });
+        // --- Платформы: только то, у чего выходили серии за последний год (а не классика 2000-х) ---
+        [['Новое на Netflix', 213], ['Новое на HBO', 49], ['Новое на Apple TV+', 2552]].forEach(function (p) {
+            cats.push({
+                title: p[0],
+                load: discoverTv({
+                    with_networks: p[1],
+                    'air_date.gte': dateShift(-365),
+                    'air_date.lte': dateShift(0),
+                    'vote_count.gte': 50,
+                    'vote_average.gte': 7.2,
+                    sort_by: 'popularity.desc'
+                })
+            });
+        });
 
         // --- Формат и темы ---
         cats.push({
@@ -662,14 +891,19 @@
         cats.push({
             title: 'Лучшее за ' + year + ' год',
             load: function (cb) {
-                tmdb('discover/movie', { primary_release_year: year, sort_by: 'vote_average.desc', 'vote_count.gte': 200 }, function (items) {
+                // от 500 голосов: у новинок с парой сотен голосов рейтинг завышен
+                tmdb('discover/movie', { primary_release_year: year, sort_by: 'vote_average.desc', 'vote_count.gte': 500 }, function (items) {
                     items = clean(items);
                     if (items.length >= 6) cb(items);
                     else tmdb('discover/movie', { primary_release_year: year - 1, sort_by: 'vote_average.desc', 'vote_count.gte': 500 }, cb);
                 });
             }
         });
-        cats.push({ title: 'Сериалы: лучшие по рейтингу', load: source('tv/top_rated') });
+        // Лучшие сериалы, вышедшие за 5 лет; от 1000 голосов — иначе лезут малоизвестные с накрученным рейтингом
+        cats.push({
+            title: 'Лучшие сериалы за 5 лет',
+            load: discoverTv({ 'first_air_date.gte': dateShift(-365 * 5), 'vote_count.gte': 1000, sort_by: 'vote_average.desc' })
+        });
         cats.push({ title: 'Для всей семьи', load: discover({ with_genres: 10751, sort_by: 'popularity.desc', 'vote_count.gte': 300 }) });
 
         // --- Классика ---
@@ -681,7 +915,8 @@
             title: 'Хиты 2000-х',
             load: discover({ 'primary_release_date.gte': '2000-01-01', 'primary_release_date.lte': '2009-12-31', sort_by: 'vote_count.desc' })
         });
-        cats.push({ title: 'Лучшие фильмы всех времён', load: source('movie/top_rated') });
+        // movie/top_rated поднимает новинки с завышенным ранним рейтингом — берём только от 5000 голосов
+        cats.push({ title: 'Лучшие фильмы всех времён', load: discover({ 'vote_count.gte': 5000, sort_by: 'vote_average.desc' }) });
 
         cats.forEach(function (c) {
             c.items = null;
@@ -693,27 +928,91 @@
         return cats;
     }
 
+    // ---------- Кэш рядов: мгновенный старт ----------
+    // Ряды хранятся на устройстве до 6 часов: при включении ТВ «Подборки» показываются сразу из кэша,
+    // а если кэшу больше 30 минут — в фоне скачивается свежий вариант для следующего открытия.
+
+    var ROWS_KEY = 'rec_rows_cache_v1';
+    var ROWS_TTL = 6 * 3600 * 1000;
+    var ROWS_REFRESH = 30 * 60 * 1000;
+    var rowsCache = null;
+
+    // Только нужные поля и короткое описание — чтобы кэш не раздувал хранилище Lampa
+    var KEEP = ['id', 'title', 'name', 'original_title', 'original_name', 'poster_path', 'backdrop_path', 'vote_average',
+        'vote_count', 'release_date', 'first_air_date', 'genre_ids', 'media_type', 'original_language', 'origin_country'];
+
+    function slim(m) {
+        var r = {};
+        KEEP.forEach(function (k) { if (m[k] !== undefined) r[k] = m[k]; });
+        if (m.overview) r.overview = m.overview.length > 500 ? m.overview.slice(0, 497) + '…' : m.overview;
+        return r;
+    }
+
+    function rowsLoad() {
+        if (rowsCache) return rowsCache;
+        try {
+            rowsCache = JSON.parse(window.localStorage.getItem(ROWS_KEY) || '{}') || {};
+        } catch (e) {
+            rowsCache = {};
+        }
+        return rowsCache;
+    }
+
+    function rowsSave(title, items) {
+        var c = rowsLoad();
+        c[title] = { t: Date.now(), items: items.map(slim) };
+        // Устаревшие ряды (например, «Хэллоуин» в декабре) выкидываем
+        Object.keys(c).forEach(function (k) { if (Date.now() - c[k].t > ROWS_TTL) delete c[k]; });
+        try {
+            window.localStorage.setItem(ROWS_KEY, JSON.stringify(c));
+        } catch (e) {
+            console.log('[rec]', 'rows cache full', e);
+        }
+    }
+
+    function finishItems(cat, items) {
+        var ids = {};
+        var list = cat.personal ? items.filter(function (m) { return m && m.poster_path; }) : clean(items);
+
+        return list.filter(function (m) {
+            if (ids[m.id]) return false;
+            ids[m.id] = true;
+            return true;
+        }).slice(0, 20);
+    }
+
     function loadCat(cat, cb) {
         if (!cat) return;
         if (cat.items) return cb && cb();
         if (cb) cat.waiters.push(cb);
         if (cat.loading) return;
 
-        cat.loading = true;
-        cat.load(function (items) {
-            var ids = {};
-            var list = cat.personal ? items.filter(function (m) { return m && m.poster_path; }) : clean(items);
-
-            cat.items = list.filter(function (m) {
-                if (ids[m.id]) return false;
-                ids[m.id] = true;
-                return true;
-            }).slice(0, 20);
+        function done(items) {
+            cat.items = items;
             cat.loading = false;
-
             var w = cat.waiters;
             cat.waiters = [];
             w.forEach(function (f) { f(); });
+        }
+
+        // Личные ряды берутся из Lampa мгновенно — их не кэшируем
+        var hit = !cat.personal && rowsLoad()[cat.title];
+        if (hit && Date.now() - hit.t < ROWS_TTL) {
+            done(finishItems(cat, hit.items));
+            if (Date.now() - hit.t > ROWS_REFRESH) {
+                cat.load(function (items) {
+                    var fresh = finishItems(cat, items);
+                    if (fresh.length) rowsSave(cat.title, fresh);
+                });
+            }
+            return;
+        }
+
+        cat.loading = true;
+        cat.load(function (items) {
+            var list = finishItems(cat, items);
+            if (!cat.personal && list.length) rowsSave(cat.title, list);
+            done(list);
         });
     }
 
@@ -728,10 +1027,12 @@
         var root = $(
             '<div class="rec-tv layer--wheight">' +
                 '<div class="rec-tv__bg"><div class="rec-tv__bg-img"></div><div class="rec-tv__bg-img"></div></div>' +
+                '<div class="rec-tv__video"></div>' +
                 '<div class="rec-tv__shade"></div>' +
+                '<div class="rec-tv__clock"></div>' +
                 '<div class="rec-tv__hero rec-hidden">' +
                     '<div class="rec-tv__genres"></div>' +
-                    '<div class="rec-tv__title"></div>' +
+                    '<div class="rec-tv__head"><div class="rec-tv__title"></div><img class="rec-tv__logo" alt="" /></div>' +
                     '<div class="rec-tv__meta"></div>' +
                     '<div class="rec-tv__overview"></div>' +
                     '<div class="rec-tv__hint">Нажмите на постер, чтобы смотреть</div>' +
@@ -751,6 +1052,9 @@
         var bgTimer;
 
         var heroEl = root.find('.rec-tv__hero');
+        var logoEl = root.find('.rec-tv__logo');
+        var videoEl = root.find('.rec-tv__video');
+        var clockEl = root.find('.rec-tv__clock');
         var rowsEl = root.find('.rec-tv__rows');
         var track = root.find('.rec-tv__track');
         var prevEl = root.find('.rec-tv__prev');
@@ -803,9 +1107,105 @@
             }, 300);
         }
 
+        // --- Шапка выбранного фильма ---
+
+        var heroItem = null;     // фильм, который сейчас показан в шапке
+        var heroTime = 0;        // когда его выбрали — от этого считаем паузу перед трейлером
+        var detailsTimer, waitTimer;
+
+        // Логотип вместо текстового названия. Пока логотип грузится (до 0.7 с), название скрыто,
+        // чтобы не мигало «текст → картинка»
+        function showTitle(m, d) {
+            var path = d && d.logo;
+
+            clearTimeout(waitTimer);
+            heroEl.removeClass('rec-tv__hero--wait');
+
+            if (!path) {
+                heroEl.removeClass('rec-tv__hero--logo');
+                return;
+            }
+
+            if (logoUrls[path]) {
+                logoEl.attr('src', logoUrls[path]);
+                heroEl.addClass('rec-tv__hero--logo');
+                return;
+            }
+
+            heroEl.removeClass('rec-tv__hero--logo').addClass('rec-tv__hero--wait');
+            waitTimer = setTimeout(function () { heroEl.removeClass('rec-tv__hero--wait'); }, 700);
+
+            loadImage(path, 'w500', function (url) {
+                logoUrls[path] = url;
+                if (destroyed || heroItem !== m) return;
+                clearTimeout(waitTimer);
+                logoEl.attr('src', url);
+                heroEl.removeClass('rec-tv__hero--wait').addClass('rec-tv__hero--logo');
+            }, function () {
+                if (heroItem === m) heroEl.removeClass('rec-tv__hero--wait');
+            });
+        }
+
+        function showMeta(m, d) {
+            var meta = root.find('.rec-tv__meta').empty();
+            var tv = isTv(m);
+
+            if (m.vote_average) {
+                meta.append($('<span class="rec-tv__rate"></span>').text('★ ' + (+m.vote_average).toFixed(1)));
+            }
+            if (yearOf(m)) meta.append($('<span></span>').text(yearOf(m)));
+
+            if (d && tv && d.seasons) meta.append($('<span></span>').text(d.seasons + ' ' + plural(d.seasons, 'сезон', 'сезона', 'сезонов')));
+            else if (d && !tv && d.runtime) meta.append($('<span></span>').text(formatRuntime(d.runtime)));
+            else meta.append($('<span></span>').text(tv ? 'Сериал' : 'Фильм'));
+
+            if (d && d.age) meta.append($('<span class="rec-tv__age"></span>').text(d.age));
+            if (tv && freshEpisode(d)) meta.append($('<span class="rec-tv__new"></span>').text('Новая серия'));
+        }
+
+        // Детали следующей карточки — заранее, чтобы вправо логотип был сразу
+        function prefetchNext() {
+            var c = cats[cur];
+            var next = c && c.items ? c.items[c.idx + 1] : null;
+            if (next) getDetails(next, function () {});
+        }
+
         function updateHero(m) {
-            if (!m) return;
+            if (!m || m === heroItem) return;   // тот же фильм (обновили ряд) — трейлер не перезапускаем
+
+            heroItem = m;
+            heroTime = Date.now();
+            stopTrailer();
             heroEl.removeClass('rec-hidden');
+
+            var d = knownDetails(m);
+
+            root.find('.rec-tv__title').text(m.title || m.name || '');
+            if (d) showTitle(m, d);
+            else {
+                // Деталей ещё нет: коротко ждём логотип, потом показываем текст
+                heroEl.removeClass('rec-tv__hero--logo').addClass('rec-tv__hero--wait');
+                clearTimeout(waitTimer);
+                waitTimer = setTimeout(function () { heroEl.removeClass('rec-tv__hero--wait'); }, 700);
+            }
+            showMeta(m, d);
+
+            // При быстром листании детали не запрашиваем на каждую карточку
+            clearTimeout(detailsTimer);
+            if (d) {
+                scheduleTrailer(m, d);
+                prefetchNext();
+            } else {
+                detailsTimer = setTimeout(function () {
+                    getDetails(m, function (dd) {
+                        if (destroyed || heroItem !== m) return;
+                        showTitle(m, dd);
+                        showMeta(m, dd);
+                        scheduleTrailer(m, dd);
+                        prefetchNext();
+                    });
+                }, 250);
+            }
 
             // У карточек из истории Lampa жанры лежат в genres: [{id, name}]
             var names = [];
@@ -820,18 +1220,146 @@
                 genres.append($('<span class="rec-tv__chip"></span>').text(n));
             });
 
-            root.find('.rec-tv__title').text(m.title || m.name || '');
-
-            var meta = root.find('.rec-tv__meta').empty();
-            if (m.vote_average) {
-                meta.append($('<span class="rec-tv__rate"></span>').text('★ ' + (+m.vote_average).toFixed(1)));
-            }
-            if (yearOf(m)) meta.append($('<span></span>').text(yearOf(m)));
-            meta.append($('<span></span>').text(isTv(m) ? 'Сериал' : 'Фильм'));
-
             root.find('.rec-tv__overview').text(m.overview || 'Описание пока не добавлено.');
 
             setBackdrop(m.backdrop_path || m.poster_path);
+        }
+
+        // --- Трейлер на фоне ---
+        // Через 3 с на одной карточке вместо фона запускается трейлер с YouTube (без звука по умолчанию).
+        // Слой видео виден только когда плеер реально заиграл — иначе остаётся обычный фон.
+
+        var TRAILER_DELAY = 3000;
+        var trailer = null;
+        var trailerTimer;
+
+        function trailerMode() {
+            var v = Lampa.Storage.get('rec_trailers', 'mute');
+            if (v === false || v === 'false' || v === 'off') return 'off';
+            return v === 'sound' ? 'sound' : 'mute';
+        }
+
+        function scheduleTrailer(m, d) {
+            clearTimeout(trailerTimer);
+            if (!d || !d.trailer || trailerMode() === 'off') return;
+
+            var wait = Math.max(0, TRAILER_DELAY - (Date.now() - heroTime));
+            trailerTimer = setTimeout(function () {
+                if (destroyed || heroItem !== m || !isActive() || document.hidden) return;
+                startTrailer(d.trailer);
+            }, wait);
+        }
+
+        // Таймер трейлера мог сработать, пока была открыта шапка или меню, — тогда планируем заново
+        function rearmTrailer() {
+            if (trailer || !heroItem || destroyed) return;
+            var d = knownDetails(heroItem);
+            if (!d) return;
+            heroTime = Date.now();
+            scheduleTrailer(heroItem, d);
+        }
+
+        function ytPost(t, func) {
+            try {
+                var msg = func ? { event: 'command', func: func, args: [] } : { event: 'listening', id: 1, channel: 'widget' };
+                t.frame[0].contentWindow.postMessage(JSON.stringify(msg), '*');
+            } catch (e) {}
+        }
+
+        function startTrailer(key) {
+            stopTrailer();
+
+            var sound = trailerMode() === 'sound';
+            var origin = /^https?:/.test(location.protocol) ? location.protocol + '//' + location.host : '';
+            var src = 'https://www.youtube.com/embed/' + encodeURIComponent(key) +
+                '?autoplay=1&start=5&mute=' + (sound ? 0 : 1) +   // первые секунды — обычно чёрный экран и логотипы студий
+                '&controls=0&disablekb=1&fs=0&modestbranding=1&rel=0&iv_load_policy=3&cc_load_policy=0&playsinline=1&enablejsapi=1' +
+                (origin ? '&origin=' + encodeURIComponent(origin) : '');
+
+            var frame = $('<iframe class="rec-tv__yt" tabindex="-1" frameborder="0" allow="autoplay; encrypted-media" referrerpolicy="strict-origin-when-cross-origin"></iframe>');
+            var t = { key: key, frame: frame, playing: false };
+            trailer = t;
+
+            frame.attr('src', src);
+            videoEl.append(frame);
+
+            // Подписываемся на события плеера (как это делает YouTube IFrame API)
+            t.listen = setInterval(function () { ytPost(t); }, 400);
+            frame.on('load', function () { ytPost(t); });
+
+            // Со звуком автозапуск может быть запрещён — тогда пробуем без звука
+            if (sound) t.unmute = setTimeout(function () {
+                if (trailer === t && !t.playing) { ytPost(t, 'mute'); ytPost(t, 'playVideo'); }
+            }, 5000);
+
+            // Не заиграл за 12 с (нет сети, видео недоступно в регионе) — тихо убираем
+            t.fail = setTimeout(function () {
+                if (trailer === t && !t.playing) stopTrailer();
+            }, 12000);
+        }
+
+        function onTrailerState(state) {
+            var t = trailer;
+            if (!t) return;
+
+            if (state === 1 && !t.playing) {
+                t.playing = true;
+                clearInterval(t.listen);
+                clearTimeout(t.fail);
+                clearTimeout(t.unmute);
+                videoEl.addClass('show');
+                root.addClass('rec-tv--trailer');
+            } else if (state === 0) {
+                stopTrailer();   // досмотрели — возвращаем фон
+            }
+        }
+
+        function onMessage(e) {
+            var t = trailer;
+            if (!t || !/youtube(-nocookie)?\.com$/.test(String(e.origin || '').replace(/:\d+$/, ''))) return;
+            if (e.source && t.frame[0].contentWindow && e.source !== t.frame[0].contentWindow) return;
+
+            var data;
+            try { data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch (err) { return; }
+            if (!data) return;
+
+            if (data.event === 'onStateChange' && typeof data.info === 'number') onTrailerState(data.info);
+            else if (data.event === 'infoDelivery' && data.info && typeof data.info.playerState === 'number') onTrailerState(data.info.playerState);
+        }
+
+        function stopTrailer() {
+            clearTimeout(trailerTimer);
+
+            var t = trailer;
+            if (!t) return;
+            trailer = null;
+
+            clearInterval(t.listen);
+            clearTimeout(t.fail);
+            clearTimeout(t.unmute);
+
+            videoEl.removeClass('show');
+            root.removeClass('rec-tv--trailer');
+
+            // Сразу глушим, а iframe убираем после того, как слой погаснет
+            ytPost(t, 'mute');
+            ytPost(t, 'pauseVideo');
+            setTimeout(function () { t.frame.attr('src', 'about:blank').remove(); }, t.playing ? 800 : 0);
+        }
+
+        function onVisibility() {
+            if (document.hidden) stopTrailer();
+            else rearmTrailer();
+        }
+
+        // --- Часы: видны, когда спрятана шапка Lampa (в ней свои часы) ---
+
+        var clockTimer;
+
+        function tick() {
+            var d = new Date();
+            var h = d.getHours(), mm = d.getMinutes();
+            clockEl.text((h < 10 ? '0' : '') + h + ':' + (mm < 10 ? '0' : '') + mm);
         }
 
         function updateLabels() {
@@ -937,9 +1465,28 @@
             return c && c.items ? c.items.indexOf(m) : -1;
         }
 
-        function makeCard(m) {
+        // «Продолжить просмотр»: полоска прогресса у фильмов, «Новая серия» у сериалов
+        function decorateCard(card, m) {
+            var box = card.find('.rec-card__img');
+
+            if (!isTv(m)) {
+                var p = 0;
+                try { p = Lampa.Timeline && Lampa.Timeline.watched ? +Lampa.Timeline.watched(m) || 0 : 0; } catch (e) {}
+                if (p >= 1 && p <= 97) {
+                    box.append('<div class="rec-card__progress"><div style="width:' + Math.round(p) + '%"></div></div>');
+                }
+                return;
+            }
+
+            getDetails(m, function (d) {
+                if (!destroyed && freshEpisode(d)) box.append('<div class="rec-card__badge">Новая серия</div>');
+            });
+        }
+
+        function makeCard(m, c) {
             var card = $('<div class="rec-card selector"><div class="rec-card__img"><img /></div></div>');
             setPoster(card.find('img')[0], m.poster_path);
+            if (c && c.personal) decorateCard(card, m);
 
             // Индекс ищем в момент события: карточки без источников могут быть убраны из ряда
             card.on('hover:focus hover:hover', function () {
@@ -949,9 +1496,11 @@
             card.on('hover:enter', function () {
                 var i = indexOfItem(m);
                 if (i >= 0) focusIdx(i);
+                stopTrailer();
                 watch(m);
             });
             card.on('hover:long', function () {
+                stopTrailer();
                 openCard(m);
             });
 
@@ -1027,7 +1576,7 @@
                 if (c.idx >= c.items.length) c.idx = c.items.length - 1;
             }
 
-            c.items.forEach(function (m) { track.append(makeCard(m)); });
+            c.items.forEach(function (m) { track.append(makeCard(m, c)); });
             focusIdx(c.idx);
 
             if (_this.activity) _this.activity.loader(false);
@@ -1048,6 +1597,12 @@
 
         this.create = function () {
             if (this.activity) this.activity.loader(true);
+
+            window.addEventListener('message', onMessage);
+            document.addEventListener('visibilitychange', onVisibility);
+            tick();
+            clockTimer = setInterval(tick, 10000);
+
             renderCat(0);
             return this.render();
         };
@@ -1064,6 +1619,7 @@
                     // Lampa снимает класс focus при уходе с экрана — восстанавливаем по сохранённому индексу
                     refreshCollection();
                     srcSchedule();
+                    rearmTrailer();
                 },
                 left: function () {
                     var c = cats[cur];
@@ -1085,11 +1641,15 @@
                 },
                 enter: function () {
                     var m = current();
-                    if (m) watch(m);
+                    if (!m) return;
+                    stopTrailer();
+                    watch(m);
                 },
                 long: function () {
                     var m = current();
-                    if (m) openCard(m);
+                    if (!m) return;
+                    stopTrailer();
+                    openCard(m);
                 },
                 back: function () {
                     Lampa.Activity.backward();
@@ -1104,18 +1664,26 @@
         };
 
         // Ушли на другой экран (карточка, Showy, главная) — шапка Lampa возвращается
-        this.pause = function () {
+        // heroItem сбрасываем, чтобы по возвращении шапка обновилась и трейлер запланировался заново
+        function leave() {
+            stopTrailer();
+            clearTimeout(detailsTimer);
+            heroItem = null;
             headMode(false);
-        };
-        this.stop = function () {
-            headMode(false);
-        };
+        }
+
+        this.pause = leave;
+        this.stop = leave;
 
         this.destroy = function () {
             destroyed = true;
             queue = [];
             clearTimeout(bgTimer);
-            headMode(false);
+            clearTimeout(waitTimer);
+            clearInterval(clockTimer);
+            leave();
+            window.removeEventListener('message', onMessage);
+            document.removeEventListener('visibilitychange', onVisibility);
             root.remove();
         };
     }
@@ -1153,10 +1721,28 @@
             '.rec-tv__hero{position:absolute;left:3em;top:1.3em;width:48%}' +
             '.rec-tv__genres{display:flex;flex-wrap:wrap;margin-bottom:.6em}' +
             '.rec-tv__chip{padding:.3em .85em;border-radius:1em;background:rgba(255,255,255,.15);font-size:.8em;margin:0 .5em .4em 0}' +
-            '.rec-tv__title{font-size:2.8em;font-weight:700;line-height:1.1;margin-bottom:.3em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
+            // Место под название фиксированное (2 строки текста = высота логотипа) — описание не прыгает
+            '.rec-tv__head{height:6.2em;display:flex;align-items:flex-end;margin-bottom:.45em}' +
+            '.rec-tv__title{font-size:2.8em;font-weight:700;line-height:1.1;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;transition:opacity .2s}' +
+            '.rec-tv__logo{display:none;flex:none;max-width:75%;max-height:100%;object-fit:contain;object-position:left bottom;filter:drop-shadow(0 .1em .5em rgba(0,0,0,.55));animation:recFade .35s ease}' +
+            '.rec-tv__hero--logo .rec-tv__logo{display:block}' +
+            '.rec-tv__hero--logo .rec-tv__title{display:none}' +
+            '.rec-tv__hero--wait .rec-tv__title{opacity:0}' +
+            '@keyframes recFade{from{opacity:0}to{opacity:1}}' +
             '.rec-tv__meta{display:flex;align-items:center;margin-bottom:.7em;font-size:1.1em}' +
             '.rec-tv__meta span{margin-right:1.1em;opacity:.9}' +
             '.rec-tv__rate{color:#ffd54a;font-weight:700;opacity:1 !important}' +
+            '.rec-tv__age{border:.08em solid rgba(255,255,255,.6);border-radius:.25em;padding:0 .35em;font-size:.85em}' +
+            '.rec-tv__new{background:#e50914;border-radius:.25em;padding:.05em .45em;font-size:.85em;font-weight:700;opacity:1 !important}' +
+            // Трейлер: под затемнением, обрезан по краям (scale), чтобы не было видно интерфейса YouTube
+            '.rec-tv__video{position:absolute;top:0;left:0;right:0;bottom:0;overflow:hidden;opacity:0;transition:opacity .8s ease;pointer-events:none}' +
+            '.rec-tv__video.show{opacity:1}' +
+            '.rec-tv__yt{position:absolute;top:50%;left:50%;width:100vw;height:56.25vw;min-width:177.78vh;min-height:100vh;border:0;pointer-events:none;' +
+                '-webkit-transform:translate(-50%,-50%) scale(1.25);transform:translate(-50%,-50%) scale(1.25)}' +
+            '.rec-tv--trailer .rec-tv__bg-img{opacity:0 !important}' +
+            '.rec-tv__clock{position:absolute;top:.9em;right:1.6em;font-size:1.5em;font-weight:600;opacity:.85;text-shadow:0 .05em .4em rgba(0,0,0,.6);display:none}' +
+            'body.rec--nohead .rec-tv__clock{display:block}' +
+            'body.rec--nohead.rec--headpeek .rec-tv__clock{display:none}' +
             // Описание крупнее
             '.rec-tv__overview{font-size:1.18em;line-height:1.45;opacity:.88;max-width:34em;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}' +
             '.rec-tv__hint{margin-top:1em;font-size:.85em;opacity:.5}' +
@@ -1178,6 +1764,9 @@
             '.rec-card__img{padding-top:150%;position:relative;border-radius:.6em;overflow:hidden;background:rgba(255,255,255,.08)}' +
             '.rec-card__img img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .3s}' +
             '.rec-card__img img.loaded{opacity:1}' +
+            '.rec-card__progress{position:absolute;left:.45em;right:.45em;bottom:.45em;height:.22em;border-radius:.2em;background:rgba(255,255,255,.3);overflow:hidden}' +
+            '.rec-card__progress div{height:100%;background:#fff}' +
+            '.rec-card__badge{position:absolute;left:.4em;top:.4em;padding:.2em .45em;border-radius:.3em;background:#e50914;font-size:.62em;font-weight:700;line-height:1.2}' +
             // Выбранная карточка крупнее; доп. отступ справа, чтобы не наезжала на соседнюю
             '.rec-card.focus{transform:scale(1.22);margin-right:3em}' +
             '.rec-card.focus .rec-card__img{box-shadow:0 0 0 .18em #fff,0 .6em 1.5em rgba(0,0,0,.6)}' +
@@ -1216,6 +1805,20 @@
             field: {
                 name: 'Скрывать верхнюю панель на «Подборках»',
                 description: 'Кнопка ↑ на верхней категории показывает её'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'rec_settings',
+            param: {
+                name: 'rec_trailers',
+                type: 'select',
+                values: { mute: 'Без звука', sound: 'Со звуком', off: 'Выключены' },
+                default: 'mute'
+            },
+            field: {
+                name: 'Трейлеры на фоне',
+                description: 'Через 3 секунды на карточке вместо фона играет трейлер с YouTube'
             }
         });
 
