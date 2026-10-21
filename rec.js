@@ -1,7 +1,7 @@
 (function () {
     'use strict';
 
-    // Lampa «Подборки» v4 — главная в стиле Apple TV / Netflix
+    // Lampa «Подборки» v5 — главная в стиле Apple TV / Netflix
     // Сверено с исходниками yumata/lampa-source (Lampa 3.x) и проверено на lampa.mx
     // Пульт: ←/→ — фильмы, ↑/↓ — категории, OK / тап по постеру — смотреть, долгий OK — карточка Lampa
 
@@ -9,7 +9,7 @@
     window.rec_plugin_ready = true;
 
     var COMPONENT = 'rec_home';
-    var VERSION = '4.1.0';
+    var VERSION = '5.0.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -25,7 +25,10 @@
         10765: 'Фантастика и фэнтези', 10766: 'Мыльная опера', 10767: 'Ток-шоу', 10768: 'Война и политика'
     };
 
-    // ---------- Сеть ----------
+    // Для сериальных рядов: без ток-шоу, новостей, реалити, детских передач и мыльных опер
+    var TV_EXCLUDE = '10767,10763,10764,10762,10766';
+
+    // ---------- Сеть TMDB ----------
 
     // Свой ключ из настроек, иначе встроенный ключ Lampa
     function apiKey() {
@@ -154,14 +157,19 @@
         return ((m.release_date || m.first_air_date || '') + '').slice(0, 4);
     }
 
-    function history() {
+    function copy(o) {
+        var r = {};
+        for (var k in o) r[k] = o[k];
+        return r;
+    }
+
+    function favorites(type) {
         try {
-            var list = Lampa.Favorite.get({ type: 'history' }) || [];
-            return list.filter(function (c) {
+            return (Lampa.Favorite.get({ type: type }) || []).filter(function (c) {
                 return c && c.id && (!c.source || c.source === 'tmdb' || c.source === 'cub');
             });
         } catch (e) {
-            console.log('[rec]', 'history error', e);
+            console.log('[rec]', 'favorite error', type, e);
             return [];
         }
     }
@@ -174,8 +182,7 @@
     }
 
     function cardData(m) {
-        var data = {};
-        for (var k in m) data[k] = m[k];
+        var data = copy(m);
         data.source = cardSource();
         if (isTv(m)) {
             data.name = m.name || m.title;
@@ -286,14 +293,178 @@
         });
     }
 
-    // ---------- Категории ----------
+    // ---------- Проверка источников в Showy RU ----------
+    // Повторяем запросы самого плагина: externalids → lite/events?life=true → lifeevents (до ready).
+    // Источник есть, если хоть у одного балансера show = true.
 
-    function today() {
-        var d = new Date();
-        var mm = d.getMonth() + 1;
-        var dd = d.getDate();
-        return d.getFullYear() + '-' + (mm < 10 ? '0' : '') + mm + '-' + (dd < 10 ? '0' : '') + dd;
+    var SHOWY = 'http://showypro.com/';
+    var SHOWY_HOST = 'showypro.com';
+    var SRC_KEY = 'rec_src_cache_v1';
+    var SRC_TTL_OK = 3 * 24 * 3600 * 1000;   // найдено — помним 3 дня
+    var SRC_TTL_NO = 24 * 3600 * 1000;       // не найдено — 1 день (новинки появляются позже)
+    var srcCache = null;
+    var srcDisabled = false;
+
+    function showyInstalled() {
+        if (window.showy_ru_lampac_plugin) return true;
+        return videoPlugins().some(function (p) { return p.component === 'showy_ru_lampac'; });
     }
+
+    function srcEnabled() {
+        if (srcDisabled) return false;
+        var v = Lampa.Storage.get('rec_hide_nosrc', true);
+        if (v === false || v === 'false') return false;
+        return showyInstalled();
+    }
+
+    function srcLoad() {
+        if (srcCache) return srcCache;
+        try {
+            srcCache = JSON.parse(window.localStorage.getItem(SRC_KEY) || '{}') || {};
+        } catch (e) {
+            srcCache = {};
+        }
+        return srcCache;
+    }
+
+    function srcSave() {
+        var keys = Object.keys(srcCache);
+        // Не даём кэшу разрастаться: оставляем 2000 самых свежих записей
+        if (keys.length > 3000) {
+            keys.sort(function (a, b) { return srcCache[a][1] - srcCache[b][1]; });
+            keys.slice(0, keys.length - 2000).forEach(function (k) { delete srcCache[k]; });
+        }
+        try {
+            window.localStorage.setItem(SRC_KEY, JSON.stringify(srcCache));
+        } catch (e) {}
+    }
+
+    function srcId(m) {
+        return (isTv(m) ? 'tv' : 'movie') + '_' + m.id;
+    }
+
+    // true — источники есть, false — нет, null — ещё не проверяли или кэш устарел
+    function srcGet(m) {
+        var c = srcLoad()[srcId(m)];
+        if (!c) return null;
+        if (Date.now() - c[1] > (c[0] ? SRC_TTL_OK : SRC_TTL_NO)) return null;
+        return !!c[0];
+    }
+
+    function srcSet(m, ok) {
+        srcLoad()[srcId(m)] = [ok ? 1 : 0, Date.now()];
+        srcSave();
+    }
+
+    // Те же параметры аккаунта, что добавляет сам плагин (функция account в его коде)
+    function showyAccount(url) {
+        var email = Lampa.Storage.get('account_email', '');
+        var uid = Lampa.Storage.get('lampac_unic_id', '');
+        var nws = Lampa.Storage.get('lampac_nws_id', '');
+        var tok = Lampa.Storage.get('showy_token', '');
+
+        if (email) url = addQuery(url, 'account_email=' + encodeURIComponent(email));
+        if (uid) url = addQuery(url, 'uid=' + encodeURIComponent(uid));
+        if (nws) url = addQuery(url, 'nws_id=' + encodeURIComponent(nws));
+        if (tok) url = addQuery(url, 'showy_token=' + encodeURIComponent(tok));
+        return url;
+    }
+
+    function showyHeaders() {
+        var k = Lampa.Storage.get('kit_kit_aesgcmkey', '');
+        return k ? { 'X-Kit-AesGcm': k } : {};
+    }
+
+    // Те же параметры поиска, что requestParams в коде плагина
+    function showyParams(m) {
+        var q = [];
+        var src = cardSource();
+        var rch = (window.rch_nws && window.rch_nws[SHOWY_HOST]) ? window.rch_nws[SHOWY_HOST].type :
+            (window.rch && window.rch[SHOWY_HOST]) ? window.rch[SHOWY_HOST].type : '';
+        var email = Lampa.Storage.get('account_email', '');
+
+        q.push('id=' + encodeURIComponent(m.id));
+        if (m.imdb_id) q.push('imdb_id=' + m.imdb_id);
+        if (m.kinopoisk_id) q.push('kinopoisk_id=' + m.kinopoisk_id);
+        q.push('title=' + encodeURIComponent(m.title || m.name || ''));
+        q.push('original_title=' + encodeURIComponent(m.original_title || m.original_name || ''));
+        q.push('serial=' + (isTv(m) ? 1 : 0));
+        q.push('original_language=' + (m.original_language || ''));
+        q.push('year=' + (yearOf(m) || '0000'));
+        q.push('source=' + src);
+        q.push('external_ids=true');
+        q.push('clarification=0');
+        q.push('similar=false');
+        q.push('rchtype=' + (rch || ''));
+        if (email && Lampa.Utils && Lampa.Utils.hash) q.push('cub_id=' + Lampa.Utils.hash(email));
+
+        return q.join('&');
+    }
+
+    function showyGet(url, timeout, ok, fail) {
+        var net = new Lampa.Reguest();
+        net.timeout(timeout);
+        net.silent(showyAccount(url), ok, fail, false, { headers: showyHeaders() });
+    }
+
+    function anyShow(list) {
+        for (var i = 0; i < list.length; i++) {
+            if (list[i] && (typeof list[i].show === 'undefined' || list[i].show)) return true;
+        }
+        return false;
+    }
+
+    function authFailed() {
+        if (srcDisabled) return;
+        srcDisabled = true;
+        Lampa.Noty.show('Showy RU: нужна авторизация — проверка источников отключена');
+    }
+
+    // done(true | false | null). null — не удалось проверить: такие карточки не скрываем
+    function checkSources(m, done) {
+        var movie = cardData(m);
+
+        function poll(memkey, n) {
+            showyGet(SHOWY + 'lifeevents?memkey=' + encodeURIComponent(memkey || '') + '&' + showyParams(movie), 8000, function (json) {
+                if (json && json.accsdb) { authFailed(); return done(null); }
+
+                var list = (json && json.online) || [];
+                if (anyShow(list)) return done(true);
+                if (json && json.ready) return done(false);
+                if (n >= 15) return done(null);
+
+                setTimeout(function () { poll(memkey, n + 1); }, 1000);
+            }, function () {
+                if (n >= 15) return done(null);
+                setTimeout(function () { poll(memkey, n + 1); }, 1000);
+            });
+        }
+
+        function events() {
+            showyGet(SHOWY + 'lite/events?life=true&' + showyParams(movie), 15000, function (json) {
+                if (!json) return done(null);
+                if (json.accsdb) { authFailed(); return done(null); }
+                if (json.life) return poll(json.memkey, 0);
+
+                var list = Object.prototype.toString.call(json) === '[object Array]' ? json : (json.online || []);
+                done(anyShow(list));
+            }, function () {
+                done(null);
+            });
+        }
+
+        var q = ['id=' + encodeURIComponent(m.id), 'serial=' + (isTv(m) ? 1 : 0)];
+        if (m.imdb_id) q.push('imdb_id=' + m.imdb_id);
+
+        showyGet(SHOWY + 'externalids?' + q.join('&'), 10000, function (json) {
+            if (json && typeof json === 'object') {
+                for (var k in json) movie[k] = json[k];
+            }
+            events();
+        }, events);
+    }
+
+    // ---------- Фильтры и источники рядов ----------
 
     // Аниме: японская/китайская/корейская анимация — убираем из всех подборок
     function isAnime(m) {
@@ -308,14 +479,9 @@
         return items.filter(function (m) {
             if (!m || !m.poster_path || isAnime(m)) return false;
             if (m.media_type && m.media_type !== 'movie' && m.media_type !== 'tv') return false;
+            if (srcGet(m) === false) return false; // уже знаем, что в Showy RU источников нет
             return true;
         });
-    }
-
-    function copy(o) {
-        var r = {};
-        for (var k in o) r[k] = o[k];
-        return r;
     }
 
     // Источник ряда: если после фильтров мало фильмов — догружаем вторую страницу
@@ -340,6 +506,49 @@
 
     function discover(params) {
         return source('discover/movie', params);
+    }
+
+    function discoverTv(params) {
+        var p = copy(params);
+        p.without_genres = TV_EXCLUDE;
+        return source('discover/tv', p);
+    }
+
+    function dateShift(days) {
+        var d = new Date(Date.now() + days * 24 * 3600 * 1000);
+        var mm = d.getMonth() + 1;
+        var dd = d.getDate();
+        return d.getFullYear() + '-' + (mm < 10 ? '0' : '') + mm + '-' + (dd < 10 ? '0' : '') + dd;
+    }
+
+    // Личные ряды из Lampa: не фильтруем аниме и не проверяем источники — это выбор пользователя
+    function personal(title, getter) {
+        return {
+            title: title,
+            personal: true,
+            load: function (cb) {
+                var list = [];
+                try { list = getter() || []; } catch (e) { console.log('[rec]', 'personal error', e); }
+                cb(list);
+            }
+        };
+    }
+
+    function continueList() {
+        if (!Lampa.Favorite.continues) return [];
+        var ok = {};
+        Lampa.Favorite.continues('movie').concat(Lampa.Favorite.continues('tv')).forEach(function (c) { ok[c.id] = true; });
+        // В порядке истории — сначала то, что смотрели последним
+        return favorites('history').filter(function (c) { return ok[c.id]; });
+    }
+
+    function bookmarksList() {
+        var seen = {};
+        return favorites('book').concat(favorites('wath'), favorites('like')).filter(function (c) {
+            if (seen[c.id]) return false;
+            seen[c.id] = true;
+            return true;
+        });
     }
 
     // Подборка по времени года: основной запрос + запасной, если основной пустой
@@ -387,6 +596,7 @@
             title: s.title,
             load: function (cb) {
                 tmdb('discover/movie', s.main, function (items) {
+                    items = clean(items);
                     if (items.length >= 6) cb(items);
                     else tmdb('discover/movie', s.spare, cb);
                 });
@@ -396,11 +606,15 @@
 
     function buildCategories() {
         var cats = [];
-        var hist = history();
+        var hist = favorites('history');
         var seen = {};
         var year = new Date().getFullYear();
 
         hist.forEach(function (c) { seen[c.id] = true; });
+
+        // --- Личное ---
+        cats.push(personal('Продолжить просмотр', continueList));
+        cats.push(personal('Ваши закладки', bookmarksList));
 
         // «Потому что вы смотрели …» по трём последним тайтлам
         hist.slice(0, 3).forEach(function (card) {
@@ -411,35 +625,59 @@
             });
         });
 
-        // Тренды отдельно для кино и сериалов
+        // --- Актуальное ---
         cats.push({ title: 'Тренды недели: кино', load: source('trending/movie/week') });
         cats.push({ title: 'Тренды недели: сериалы', load: source('trending/tv/week') });
-
-        // Новинки
-        cats.push({ title: 'Сейчас в кино', load: source('movie/now_playing') });
-        // movie/upcoming отдаёт и уже вышедшие фильмы, поэтому берём discover с датой от сегодня
         cats.push({
-            title: 'Скоро в кино',
-            load: discover({ 'primary_release_date.gte': today(), sort_by: 'popularity.desc' })
+            title: 'Вышло в цифре недавно',
+            load: discover({
+                with_release_type: 4,
+                'release_date.gte': dateShift(-60),
+                'release_date.lte': dateShift(0),
+                sort_by: 'popularity.desc',
+                'vote_count.gte': 20
+            })
         });
+        cats.push({ title: 'Новые серии на этой неделе', load: source('tv/on_the_air') });
+        cats.push({
+            title: 'Премьеры сериалов этого месяца',
+            load: discoverTv({ 'first_air_date.gte': dateShift(-30), 'first_air_date.lte': dateShift(0), sort_by: 'popularity.desc' })
+        });
+        cats.push({ title: 'Сейчас в кино', load: source('movie/now_playing') });
+        cats.push({ title: 'Скоро в кино', load: discover({ 'primary_release_date.gte': dateShift(0), sort_by: 'popularity.desc' }) });
 
         cats.push(seasonCategory());
+
+        // --- Платформы ---
+        cats.push({ title: 'Сериалы Netflix', load: discoverTv({ with_networks: 213, sort_by: 'popularity.desc', 'vote_count.gte': 100 }) });
+        cats.push({ title: 'Сериалы HBO', load: discoverTv({ with_networks: 49, sort_by: 'popularity.desc', 'vote_count.gte': 100 }) });
+        cats.push({ title: 'Сериалы Apple TV+', load: discoverTv({ with_networks: 2552, sort_by: 'popularity.desc', 'vote_count.gte': 50 }) });
+
+        // --- Формат и темы ---
+        cats.push({
+            title: 'Коротко на вечер: фильмы до 100 минут',
+            load: discover({ 'with_runtime.gte': 60, 'with_runtime.lte': 100, 'vote_average.gte': 6.5, 'vote_count.gte': 500, sort_by: 'popularity.desc' })
+        });
+        cats.push({ title: 'Мини-сериалы на выходные', load: discoverTv({ with_type: 2, sort_by: 'popularity.desc', 'vote_count.gte': 100 }) });
+        cats.push({
+            title: 'Основано на реальных событиях',
+            load: discover({ with_keywords: 9672, sort_by: 'popularity.desc', 'vote_count.gte': 300 })
+        });
 
         cats.push({
             title: 'Лучшее за ' + year + ' год',
             load: function (cb) {
                 tmdb('discover/movie', { primary_release_year: year, sort_by: 'vote_average.desc', 'vote_count.gte': 200 }, function (items) {
+                    items = clean(items);
                     if (items.length >= 6) cb(items);
                     else tmdb('discover/movie', { primary_release_year: year - 1, sort_by: 'vote_average.desc', 'vote_count.gte': 500 }, cb);
                 });
             }
         });
-
-        // Сериалы (тренды сериалов — выше, отдельным рядом)
-        cats.push({ title: 'Сериалы: сейчас в эфире', load: source('tv/on_the_air') });
         cats.push({ title: 'Сериалы: лучшие по рейтингу', load: source('tv/top_rated') });
+        cats.push({ title: 'Для всей семьи', load: discover({ with_genres: 10751, sort_by: 'popularity.desc', 'vote_count.gte': 300 }) });
 
-        // Жанры
+        // --- Жанры ---
         [
             ['Боевики', 28], ['Фантастика', 878], ['Комедии', 35], ['Триллеры', 53],
             ['Ужасы', 27], ['Драмы', 18], ['Детективы', 9648]
@@ -450,6 +688,15 @@
             });
         });
 
+        // --- Классика ---
+        cats.push({
+            title: 'Хиты 90-х',
+            load: discover({ 'primary_release_date.gte': '1990-01-01', 'primary_release_date.lte': '1999-12-31', sort_by: 'vote_count.desc' })
+        });
+        cats.push({
+            title: 'Хиты 2000-х',
+            load: discover({ 'primary_release_date.gte': '2000-01-01', 'primary_release_date.lte': '2009-12-31', sort_by: 'vote_count.desc' })
+        });
         cats.push({ title: 'Лучшие фильмы всех времён', load: source('movie/top_rated') });
 
         cats.forEach(function (c) {
@@ -471,7 +718,9 @@
         cat.loading = true;
         cat.load(function (items) {
             var ids = {};
-            cat.items = clean(items).filter(function (m) {
+            var list = cat.personal ? items.filter(function (m) { return m && m.poster_path; }) : clean(items);
+
+            cat.items = list.filter(function (m) {
                 if (ids[m.id]) return false;
                 ids[m.id] = true;
                 return true;
@@ -523,6 +772,11 @@
         var prevEl = root.find('.rec-tv__prev');
         var nextEl = root.find('.rec-tv__next');
 
+        // Очередь проверки источников: по 2 фильма одновременно
+        var queue = [];
+        var running = 0;
+        var inflight = {};
+
         function isActive() {
             var a = Lampa.Activity.active();
             return a && a.activity === _this.activity && Lampa.Controller.enabled().name === 'content';
@@ -554,16 +808,24 @@
             if (!m) return;
             heroEl.removeClass('rec-hidden');
 
+            // У карточек из истории Lampa жанры лежат в genres: [{id, name}]
+            var names = [];
+            if (m.genre_ids) {
+                m.genre_ids.forEach(function (id) { if (GENRES[id]) names.push(GENRES[id]); });
+            } else if (m.genres) {
+                m.genres.forEach(function (g) { if (g && (GENRES[g.id] || g.name)) names.push(GENRES[g.id] || g.name); });
+            }
+
             var genres = root.find('.rec-tv__genres').empty();
-            (m.genre_ids || []).slice(0, 3).forEach(function (id) {
-                if (GENRES[id]) genres.append($('<span class="rec-tv__chip"></span>').text(GENRES[id]));
+            names.slice(0, 3).forEach(function (n) {
+                genres.append($('<span class="rec-tv__chip"></span>').text(n));
             });
 
             root.find('.rec-tv__title').text(m.title || m.name || '');
 
             var meta = root.find('.rec-tv__meta').empty();
             if (m.vote_average) {
-                meta.append($('<span class="rec-tv__rate"></span>').text('★ ' + m.vote_average.toFixed(1)));
+                meta.append($('<span class="rec-tv__rate"></span>').text('★ ' + (+m.vote_average).toFixed(1)));
             }
             if (yearOf(m)) meta.append($('<span></span>').text(yearOf(m)));
             meta.append($('<span></span>').text(isTv(m) ? 'Сериал' : 'Фильм'));
@@ -581,7 +843,74 @@
             nextEl.text(cur < cats.length - 1 ? '▼  ' + cats[cur + 1].title : '').toggleClass('rec-hidden', cur >= cats.length - 1);
         }
 
-        function focusIdx(i) {
+        // --- Проверка источников ---
+
+        function srcSchedule() {
+            var c = cats[cur];
+            if (!srcEnabled() || !c || !c.items || c.personal) {
+                queue = [];
+                return;
+            }
+
+            // Сначала выбранная карточка и следующие за ней, потом предыдущие
+            var order = [];
+            var i;
+            for (i = c.idx; i < c.items.length; i++) order.push(c.items[i]);
+            for (i = c.idx - 1; i >= 0; i--) order.push(c.items[i]);
+
+            queue = order.filter(function (m) {
+                return srcGet(m) === null && !inflight[srcId(m)];
+            }).map(function (m) {
+                return { m: m, c: c };
+            });
+
+            pump();
+        }
+
+        function pump() {
+            while (running < 2 && queue.length && srcEnabled()) {
+                var job = queue.shift();
+                var id = srcId(job.m);
+                if (inflight[id] || srcGet(job.m) !== null) continue;
+
+                inflight[id] = true;
+                running++;
+
+                (function (job, id) {
+                    checkSources(job.m, function (ok) {
+                        running--;
+                        delete inflight[id];
+
+                        if (ok !== null) srcSet(job.m, ok);
+                        if (destroyed) return;
+                        if (ok === false) dropItem(job.c, job.m);
+
+                        pump();
+                    });
+                })(job, id);
+            }
+        }
+
+        // Убираем карточку без источников из ряда, не сбивая выбор
+        function dropItem(c, m) {
+            var i = c.items.indexOf(m);
+            if (i < 0) return;
+
+            c.items.splice(i, 1);
+
+            if (!c.items.length) return removeCat(c);
+            if (cats[cur] !== c) return;
+
+            track.children('.rec-card').eq(i).remove();
+            if (i < c.idx) c.idx--;
+            focusIdx(Math.min(c.idx, c.items.length - 1), true);
+
+            if (isActive()) Lampa.Controller.collectionSet(root);
+        }
+
+        // --- Навигация ---
+
+        function focusIdx(i, noSchedule) {
             var c = cats[cur];
             if (!c || !c.items || !c.items.length) return;
 
@@ -600,18 +929,27 @@
             track.css('transform', 'translate3d(' + (-off) + 'px,0,0)');
 
             updateHero(c.items[i]);
+
+            if (!noSchedule) srcSchedule();
         }
 
-        function makeCard(m, i) {
+        function indexOfItem(m) {
+            var c = cats[cur];
+            return c && c.items ? c.items.indexOf(m) : -1;
+        }
+
+        function makeCard(m) {
             var card = $('<div class="rec-card selector"><div class="rec-card__img"><img /></div></div>');
             setPoster(card.find('img')[0], m.poster_path);
 
-            // Мышь и тач: наведение выбирает, клик — смотреть, долгий тап — карточка
+            // Индекс ищем в момент события: карточки без источников могут быть убраны из ряда
             card.on('hover:focus hover:hover', function () {
-                if (cats[cur] && cats[cur].idx !== i) focusIdx(i);
+                var i = indexOfItem(m);
+                if (i >= 0 && cats[cur].idx !== i) focusIdx(i);
             });
             card.on('hover:enter', function () {
-                focusIdx(i);
+                var i = indexOfItem(m);
+                if (i >= 0) focusIdx(i);
                 watch(m);
             });
             card.on('hover:long', function () {
@@ -667,6 +1005,7 @@
             var c = cats[cur];
             if (!c) return showEmpty();
 
+            queue = [];
             updateLabels();
             animateRows(dir);
             track.empty().css('transform', 'translate3d(0,0,0)');
@@ -682,7 +1021,14 @@
                 return;
             }
 
-            c.items.forEach(function (m, i) { track.append(makeCard(m, i)); });
+            // Убираем то, что уже успели отметить как «нет источников» в других рядах
+            if (!c.personal) {
+                c.items = c.items.filter(function (m) { return srcGet(m) !== false; });
+                if (!c.items.length) return removeCat(c);
+                if (c.idx >= c.items.length) c.idx = c.items.length - 1;
+            }
+
+            c.items.forEach(function (m) { track.append(makeCard(m)); });
             focusIdx(c.idx);
 
             if (_this.activity) _this.activity.loader(false);
@@ -762,6 +1108,7 @@
 
         this.destroy = function () {
             destroyed = true;
+            queue = [];
             clearTimeout(bgTimer);
             root.remove();
         };
@@ -780,30 +1127,31 @@
             '.rec-tv__shade{background:' +
                 'linear-gradient(90deg,rgba(' + bg + ',.96) 0%,rgba(' + bg + ',.78) 32%,rgba(' + bg + ',.15) 65%,rgba(' + bg + ',0) 100%),' +
                 'linear-gradient(0deg,rgba(' + bg + ',1) 0%,rgba(' + bg + ',.92) 30%,rgba(' + bg + ',0) 60%)}' +
-            '.rec-tv__hero{position:absolute;left:3em;top:1.6em;width:46%}' +
-            '.rec-tv__genres{display:flex;flex-wrap:wrap;margin-bottom:.7em}' +
+            '.rec-tv__hero{position:absolute;left:3em;top:1.3em;width:48%}' +
+            '.rec-tv__genres{display:flex;flex-wrap:wrap;margin-bottom:.6em}' +
             '.rec-tv__chip{padding:.3em .85em;border-radius:1em;background:rgba(255,255,255,.15);font-size:.8em;margin:0 .5em .4em 0}' +
-            '.rec-tv__title{font-size:2.8em;font-weight:700;line-height:1.1;margin-bottom:.35em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
-            '.rec-tv__meta{display:flex;align-items:center;margin-bottom:.8em}' +
+            '.rec-tv__title{font-size:2.8em;font-weight:700;line-height:1.1;margin-bottom:.3em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
+            '.rec-tv__meta{display:flex;align-items:center;margin-bottom:.7em;font-size:1.1em}' +
             '.rec-tv__meta span{margin-right:1.1em;opacity:.9}' +
             '.rec-tv__rate{color:#ffd54a;font-weight:700;opacity:1 !important}' +
-            '.rec-tv__overview{line-height:1.45;opacity:.85;max-width:36em;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}' +
-            '.rec-tv__hint{margin-top:1.1em;font-size:.8em;opacity:.5}' +
+            // Описание крупнее
+            '.rec-tv__overview{font-size:1.18em;line-height:1.45;opacity:.88;max-width:34em;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}' +
+            '.rec-tv__hint{margin-top:1em;font-size:.85em;opacity:.5}' +
             '.rec-tv__rows{position:absolute;left:0;right:0;bottom:.6em}' +
             '.rec-tv__rows--down{animation:recInDown .3s ease}' +
             '.rec-tv__rows--up{animation:recInUp .3s ease}' +
             '@keyframes recInDown{from{opacity:0;transform:translateY(1.5em)}to{opacity:1;transform:none}}' +
             '@keyframes recInUp{from{opacity:0;transform:translateY(-1.5em)}to{opacity:1;transform:none}}' +
-            '.rec-tv__prev,.rec-tv__next{margin-left:3.4em;font-size:.85em;opacity:.45;padding:.25em 0;display:inline-block}' +
-            '.rec-tv__prev{margin-bottom:.4em}' +
+            '.rec-tv__prev,.rec-tv__next{margin-left:3.3em;font-size:.9em;opacity:.45;padding:.25em 0;display:inline-block}' +
+            '.rec-tv__prev{margin-bottom:.3em}' +
             '.rec-tv__prev.focus,.rec-tv__next.focus{opacity:.9}' +
-            // 2.22em × 1.35 = 3em — заголовок ровно над левым краем карточек
-            '.rec-tv__cat{margin:.2em 0 0 2.22em;font-size:1.35em;font-weight:600;display:flex;align-items:baseline}' +
-            '.rec-tv__count{font-size:.6em;opacity:.45;margin-left:.9em;font-weight:400}' +
-            // Отступы под увеличенную карточку: сверху от заголовка и снизу до подписи следующей категории
-            '.rec-tv__line{overflow:hidden;padding:2em 0 1.8em 3em}' +
+            // Заголовок категории крупнее; 1.875em × 1.6 = 3em — ровно над левым краем карточек
+            '.rec-tv__cat{margin:0 0 0 1.875em;font-size:1.6em;font-weight:700;display:flex;align-items:baseline}' +
+            '.rec-tv__count{font-size:.5em;opacity:.45;margin-left:.9em;font-weight:400}' +
+            // Отступы под увеличенную карточку: от заголовка сверху и до подписи следующей категории снизу
+            '.rec-tv__line{overflow:hidden;padding:2.9em 0 2.2em 3em}' +
             '.rec-tv__track{display:flex;transition:transform .3s ease;will-change:transform}' +
-            '.rec-card{position:relative;flex:0 0 auto;width:8.4em;margin-right:1.1em;transition:transform .2s ease,margin .2s ease;transform-origin:left center}' +
+            '.rec-card{position:relative;flex:0 0 auto;width:8.2em;margin-right:1.1em;transition:transform .2s ease,margin .2s ease;transform-origin:left center}' +
             '.rec-card__img{padding-top:150%;position:relative;border-radius:.6em;overflow:hidden;background:rgba(255,255,255,.08)}' +
             '.rec-card__img img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .3s}' +
             '.rec-card__img img.loaded{opacity:1}' +
@@ -833,7 +1181,28 @@
         Lampa.SettingsApi.addParam({
             component: 'rec_settings',
             param: { name: 'rec_watch_plugin', type: 'select', values: values, default: 'auto' },
-            field: { name: 'Плагин для «Смотреть»', description: 'Что запускается по OK на карточке' }
+            field: { name: 'Плагин для «Смотреть»', description: 'Что запускается по нажатию на постер' }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'rec_settings',
+            param: { name: 'rec_hide_nosrc', type: 'trigger', default: true },
+            field: {
+                name: 'Скрывать фильмы без источников',
+                description: 'Проверка в Showy RU в фоне. Найденное помнится 3 дня, ненайденное — 1 день'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'rec_settings',
+            param: { name: 'rec_src_reset', type: 'button' },
+            field: { name: 'Сбросить кэш источников', description: 'Перепроверить все фильмы заново' },
+            onChange: function () {
+                srcCache = {};
+                srcSave();
+                srcDisabled = false;
+                Lampa.Noty.show('Кэш источников очищен');
+            }
         });
 
         // values: '' обязателен для type: 'input' — без него Lampa падает при открытии раздела
