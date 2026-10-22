@@ -9,7 +9,7 @@
     window.rec_plugin_ready = true;
 
     var COMPONENT = 'rec_home';
-    var VERSION = '6.0.0';
+    var VERSION = '6.1.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -113,7 +113,11 @@
         attempt(0);
     }
 
+    // Списки всегда запрашиваем с номером страницы: без page прокси TMDB (apitmdb.cub) отдаёт
+    // свой старый кэш — например, тренды недели без «Одиссеи». С page=1 ответ свежий
     function tmdb(path, params, cb) {
+        params = copy(params || {});
+        if (!params.page) params.page = 1;
         tmdbJson(path, params, function (j) {
             cb(j && j.results ? j.results : []);
         });
@@ -257,17 +261,56 @@
         }, 300);
     }
 
-    function watch(m) {
+    // Чем откроется «Смотреть» — для подписи лоадера
+    function watchName() {
+        var p = findVideoPlugin();
+        if (!p) return 'карточку';
+        return p.component === 'showy_ru_lampac' ? 'Showy RU' : (p.name || 'плеер');
+    }
+
+    // Отмена запуска «Назад»: плагин мог уже начать свою проверку (Showy — подписку)
+    // и открыть экран через несколько секунд. Такое запоздалое открытие пропускаем.
+    var swallow = null;   // { component, until }
+
+    function guardLatePush() {
+        if (!Lampa.Activity || Lampa.Activity.rec_guarded) return;
+        var push = Lampa.Activity.push;
+        Lampa.Activity.push = function (obj) {
+            if (swallow) {
+                var hit = obj && obj.component === swallow.component && Date.now() < swallow.until;
+                swallow = null;   // пропускаем не больше одного раза; любой другой переход — отмена пропуска
+                if (hit) {
+                    console.log('[rec]', 'запуск отменён — экран плагина не открываем');
+                    return;
+                }
+            }
+            return push.apply(this, arguments);
+        };
+        Lampa.Activity.rec_guarded = true;
+    }
+
+    function cancelWatch(ctx) {
+        ctx.cancelled = true;
+        if (ctx.plugin && ctx.launched) {
+            guardLatePush();
+            swallow = { component: ctx.plugin.component, until: Date.now() + 30000 };
+        }
+    }
+
+    // ctx.cancelled — пользователь отменил запуск, пока догружали imdb_id
+    function watch(m, ctx) {
+        ctx = ctx || {};
         var plugin = findVideoPlugin();
 
+        swallow = null;   // новый запуск — прошлую отмену забываем
         if (!plugin) return watchViaCard(m);
 
         var data = cardData(m);
-        var cancelled = false;
+        ctx.plugin = plugin;
 
         function launch() {
-            if (cancelled) return;
-            Lampa.Loading.stop();
+            if (ctx.cancelled) return;
+            ctx.launched = true;
             try {
                 plugin.onContextLauch(data);
             } catch (e) {
@@ -276,15 +319,16 @@
             }
         }
 
+        // imdb_id обычно уже пришёл вместе с деталями (логотип, длительность) — без лишнего запроса
+        var d = knownDetails(m);
+        if (!data.imdb_id && d && typeof d.imdb === 'string') {
+            if (d.imdb) data.imdb_id = d.imdb;
+            return launch();
+        }
+
         if (data.imdb_id) return launch();
 
         // Как и Lampa, сначала подтягиваем imdb_id — по нему плагины ищут точнее
-        Lampa.Loading.start(function () {
-            cancelled = true;
-            Lampa.Loading.stop();
-            Lampa.Controller.toContent();
-        });
-
         tmdbJson((isTv(m) ? 'tv' : 'movie') + '/' + m.id + '/external_ids', {}, function (j) {
             if (j && j.imdb_id) data.imdb_id = j.imdb_id;
             launch();
@@ -511,8 +555,11 @@
     }
 
     function parseDetails(j, tv) {
-        var r = { runtime: 0, seasons: 0, age: '', logo: '', trailer: '', lastEp: '', nextEp: '' };
+        var r = { runtime: 0, seasons: 0, age: '', logo: '', trailer: '', lastEp: '', nextEp: '', imdb: '' };
         var i;
+
+        // imdb_id нужен плагину просмотра — берём сразу, чтобы при нажатии не ждать отдельный запрос
+        r.imdb = j.imdb_id || (j.external_ids && j.external_ids.imdb_id) || '';
 
         if (tv) {
             r.seasons = j.number_of_seasons || 0;
@@ -565,7 +612,7 @@
     }
 
     // Детали помним между запусками: логотип и длительность видны сразу, без запроса
-    var DET_KEY = 'rec_details_v1';
+    var DET_KEY = 'rec_details_v2';   // v2: + imdb
     var DET_TTL = 2 * 24 * 3600 * 1000;
     var DET_MAX = 400;
     var detStore = null;
@@ -573,6 +620,9 @@
 
     function detLoad() {
         if (detStore) return detStore;
+        try {
+            window.localStorage.removeItem('rec_details_v1');   // старый формат без imdb
+        } catch (e) {}
         try {
             detStore = JSON.parse(window.localStorage.getItem(DET_KEY) || '{}') || {};
         } catch (e) {
@@ -631,7 +681,7 @@
 
         var tv = isTv(m);
         tmdbJson((tv ? 'tv/' : 'movie/') + m.id, {
-            append_to_response: tv ? 'images,content_ratings,videos' : 'images,release_dates,videos',
+            append_to_response: tv ? 'images,content_ratings,videos,external_ids' : 'images,release_dates,videos',
             include_image_language: 'ru,en,null',
             include_video_language: 'ru,en'
         }, function (j) {
@@ -932,7 +982,7 @@
     // Ряды хранятся на устройстве до 6 часов: при включении ТВ «Подборки» показываются сразу из кэша,
     // а если кэшу больше 30 минут — в фоне скачивается свежий вариант для следующего открытия.
 
-    var ROWS_KEY = 'rec_rows_cache_v1';
+    var ROWS_KEY = 'rec_rows_cache_v2';   // v2: ряды, загруженные с page=1 (v1 мог хранить старые тренды)
     var ROWS_TTL = 6 * 3600 * 1000;
     var ROWS_REFRESH = 30 * 60 * 1000;
     var rowsCache = null;
@@ -950,6 +1000,9 @@
 
     function rowsLoad() {
         if (rowsCache) return rowsCache;
+        try {
+            window.localStorage.removeItem('rec_rows_cache_v1');
+        } catch (e) {}
         try {
             rowsCache = JSON.parse(window.localStorage.getItem(ROWS_KEY) || '{}') || {};
         } catch (e) {
@@ -1483,6 +1536,75 @@
             });
         }
 
+        // --- Запуск просмотра ---
+        // Showy RU перед открытием проверяет подписку на своём сервере (до 10 с, с повторами),
+        // и всё это время на экране ничего не происходит. Поэтому сразу показываем лоадер на постере
+        // и не пускаем повторные нажатия: каждое новое нажатие перезапускает проверку в Showy.
+
+        var HINT = 'Нажмите на постер, чтобы смотреть';
+        var LAUNCH_TIMEOUT = 25000;
+        var launching = null;
+
+        function noop() {}
+
+        function play(m) {
+            if (launching || !m) return;
+
+            stopTrailer();
+
+            var c = cats[cur];
+            var el = track.children('.rec-card').eq(c ? c.idx : 0);
+            var ctx = { cancelled: false };
+            var name = watchName();
+
+            launching = { ctx: ctx, el: el };
+
+            el.addClass('rec-card--loading').find('.rec-card__img').append('<div class="rec-card__spin"></div>');
+            heroEl.addClass('rec-tv__hero--loading');
+            root.find('.rec-tv__hint').text('Открываем ' + name + '…');
+
+            // Пока ждём — пульт ничего не делает, «Назад» отменяет
+            Lampa.Controller.add('rec_launch', {
+                invisible: true,
+                toggle: noop,
+                left: noop, right: noop, up: noop, down: noop,
+                enter: noop, long: noop,
+                back: function () { endLaunch(true); }
+            });
+            Lampa.Controller.toggle('rec_launch');
+
+            // Плагин открыл свой экран или окно (например, авторизацию Showy) — лоадер больше не нужен
+            launching.poll = setInterval(function () {
+                if (Lampa.Controller.enabled().name !== 'rec_launch') endLaunch(false);
+            }, 250);
+
+            launching.timer = setTimeout(function () {
+                endLaunch(true);
+                Lampa.Noty.show(name + ' долго не отвечает — попробуйте ещё раз');
+            }, LAUNCH_TIMEOUT);
+
+            watch(m, ctx);
+        }
+
+        // restore: вернуть пульт на экран (отмена или таймаут)
+        function endLaunch(restore) {
+            var l = launching;
+            if (!l) return;
+            launching = null;
+
+            clearInterval(l.poll);
+            clearTimeout(l.timer);
+
+            l.el.removeClass('rec-card--loading').find('.rec-card__spin').remove();
+            heroEl.removeClass('rec-tv__hero--loading');
+            root.find('.rec-tv__hint').text(HINT);
+
+            if (restore) {
+                cancelWatch(l.ctx);
+                if (Lampa.Controller.enabled().name === 'rec_launch') Lampa.Controller.toggle('content');
+            }
+        }
+
         function makeCard(m, c) {
             var card = $('<div class="rec-card selector"><div class="rec-card__img"><img /></div></div>');
             setPoster(card.find('img')[0], m.poster_path);
@@ -1490,16 +1612,18 @@
 
             // Индекс ищем в момент события: карточки без источников могут быть убраны из ряда
             card.on('hover:focus hover:hover', function () {
+                if (launching) return;
                 var i = indexOfItem(m);
                 if (i >= 0 && cats[cur].idx !== i) focusIdx(i);
             });
             card.on('hover:enter', function () {
+                if (launching) return;
                 var i = indexOfItem(m);
                 if (i >= 0) focusIdx(i);
-                stopTrailer();
-                watch(m);
+                play(m);
             });
             card.on('hover:long', function () {
+                if (launching) return;
                 stopTrailer();
                 openCard(m);
             });
@@ -1640,10 +1764,7 @@
                     switchCat(1);
                 },
                 enter: function () {
-                    var m = current();
-                    if (!m) return;
-                    stopTrailer();
-                    watch(m);
+                    play(current());
                 },
                 long: function () {
                     var m = current();
@@ -1666,6 +1787,7 @@
         // Ушли на другой экран (карточка, Showy, главная) — шапка Lampa возвращается
         // heroItem сбрасываем, чтобы по возвращении шапка обновилась и трейлер запланировался заново
         function leave() {
+            endLaunch(false);
             stopTrailer();
             clearTimeout(detailsTimer);
             heroItem = null;
@@ -1768,6 +1890,13 @@
             '.rec-card__progress div{height:100%;background:#fff}' +
             '.rec-card__badge{position:absolute;left:.4em;top:.4em;padding:.2em .45em;border-radius:.3em;background:#e50914;font-size:.62em;font-weight:700;line-height:1.2}' +
             // Выбранная карточка крупнее; доп. отступ справа, чтобы не наезжала на соседнюю
+            // Лоадер запуска: постер затемняется, по центру крутится кольцо
+            '.rec-card--loading .rec-card__img:after{content:"";position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.55)}' +
+            '.rec-card__spin{position:absolute;top:50%;left:50%;width:3em;height:3em;margin:-1.5em 0 0 -1.5em;z-index:2;box-sizing:border-box;' +
+                'border:.28em solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;-webkit-animation:recSpin .8s linear infinite;animation:recSpin .8s linear infinite}' +
+            '@-webkit-keyframes recSpin{to{-webkit-transform:rotate(360deg)}}' +
+            '@keyframes recSpin{to{transform:rotate(360deg)}}' +
+            '.rec-tv__hero--loading .rec-tv__hint{opacity:.95}' +
             '.rec-card.focus{transform:scale(1.22);margin-right:3em}' +
             '.rec-card.focus .rec-card__img{box-shadow:0 0 0 .18em #fff,0 .6em 1.5em rgba(0,0,0,.6)}' +
             '.rec-card--skeleton .rec-card__img{animation:recPulse 1.2s ease-in-out infinite}' +
