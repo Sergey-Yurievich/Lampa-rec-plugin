@@ -9,7 +9,9 @@
     window.rec_plugin_ready = true;
 
     var COMPONENT = 'rec_home';
-    var VERSION = '6.1.0';
+    var COMPONENT_ALL = 'rec_all';   // экран «Смотреть все» — вся подборка сеткой
+    var HINT_TEXT = 'Нажмите на постер, чтобы смотреть';
+    var VERSION = '6.2.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -111,16 +113,6 @@
         }
 
         attempt(0);
-    }
-
-    // Списки всегда запрашиваем с номером страницы: без page прокси TMDB (apitmdb.cub) отдаёт
-    // свой старый кэш — например, тренды недели без «Одиссеи». С page=1 ответ свежий
-    function tmdb(path, params, cb) {
-        params = copy(params || {});
-        if (!params.page) params.page = 1;
-        tmdbJson(path, params, function (j) {
-            cb(j && j.results ? j.results : []);
-        });
     }
 
     // Загрузка картинки с перебором зеркал
@@ -333,6 +325,76 @@
             if (j && j.imdb_id) data.imdb_id = j.imdb_id;
             launch();
         });
+    }
+
+    // ---------- Лоадер запуска ----------
+    // Showy RU перед открытием проверяет подписку на своём сервере (до 10 с, с повторами),
+    // и всё это время на экране ничего не происходит. Поэтому сразу показываем лоадер на постере
+    // и не пускаем повторные нажатия: каждое новое нажатие перезапускает проверку в Showy.
+    // Общий для главной и экрана «Смотреть все».
+
+    var LAUNCH_TIMEOUT = 25000;
+    var launching = null;
+
+    function noop() {}
+
+    function isLaunching() {
+        return !!launching;
+    }
+
+    // ui: { el — карточка, hint — подпись под описанием (необязательно), box — блок, который подсвечивается }
+    function launchWatch(m, ui) {
+        if (launching || !m) return;
+
+        var ctx = { cancelled: false };
+        var name = watchName();
+
+        launching = { ctx: ctx, ui: ui, hintText: ui.hint ? ui.hint.text() : '' };
+
+        ui.el.addClass('rec-card--loading').find('.rec-card__img').append('<div class="rec-card__spin"></div>');
+        if (ui.box) ui.box.addClass('rec-launching');
+        if (ui.hint) ui.hint.text('Открываем ' + name + '…');
+
+        // Пока ждём — пульт ничего не делает, «Назад» отменяет
+        Lampa.Controller.add('rec_launch', {
+            invisible: true,
+            toggle: noop,
+            left: noop, right: noop, up: noop, down: noop,
+            enter: noop, long: noop,
+            back: function () { endLaunch(true); }
+        });
+        Lampa.Controller.toggle('rec_launch');
+
+        // Плагин открыл свой экран или окно (например, авторизацию Showy) — лоадер больше не нужен
+        launching.poll = setInterval(function () {
+            if (Lampa.Controller.enabled().name !== 'rec_launch') endLaunch(false);
+        }, 250);
+
+        launching.timer = setTimeout(function () {
+            endLaunch(true);
+            Lampa.Noty.show(name + ' долго не отвечает — попробуйте ещё раз');
+        }, LAUNCH_TIMEOUT);
+
+        watch(m, ctx);
+    }
+
+    // restore: вернуть пульт на экран (отмена или таймаут)
+    function endLaunch(restore) {
+        var l = launching;
+        if (!l) return;
+        launching = null;
+
+        clearInterval(l.poll);
+        clearTimeout(l.timer);
+
+        l.ui.el.removeClass('rec-card--loading').find('.rec-card__spin').remove();
+        if (l.ui.box) l.ui.box.removeClass('rec-launching');
+        if (l.ui.hint) l.ui.hint.text(l.hintText);
+
+        if (restore) {
+            cancelWatch(l.ctx);
+            if (Lampa.Controller.enabled().name === 'rec_launch') Lampa.Controller.toggle('content');
+        }
     }
 
     // ---------- Проверка источников в Showy RU ----------
@@ -720,34 +782,84 @@
         return !!(d && d.lastEp && d.lastEp >= dateShift(-7) && d.lastEp <= dateShift(0));
     }
 
-    // Источник ряда: если после фильтров мало фильмов — догружаем вторую страницу
-    function source(path, params, filter) {
-        params = params || {};
-        return function (cb) {
-            tmdb(path, params, function (a) {
-                a = clean(a);
-                if (filter) a = a.filter(filter);
-                if (a.length >= 12) return cb(a);
+    // ---------- Ленты подборок ----------
+    // Лента — один или несколько запросов TMDB. Номер страницы передаём всегда: без page прокси TMDB
+    // (apitmdb.cub) отдаёт свой старый кэш — например, тренды недели без «Одиссеи».
+    // page(n, cb(items, more)) — n-я страница всех запросов, очищенная и склеенная (для экрана «Смотреть все»);
+    // load(cb) — то, что показываем в ряду на главной.
 
-                var p2 = copy(params);
-                p2.page = 2;
-                tmdb(path, p2, function (b) {
-                    b = clean(b);
-                    if (filter) b = b.filter(filter);
-                    cb(a.concat(b));
+    function feed(queries, opts) {
+        opts = opts || {};
+
+        function page(n, cb) {
+            var parts = [];
+            var left = queries.length;
+            var more = false;
+
+            queries.forEach(function (q, i) {
+                var p = copy(q[1] || {});
+                p.page = n;
+                tmdbJson(q[0], p, function (j) {
+                    parts[i] = clean((j && j.results) || []);
+                    if (j && j.total_pages > n) more = true;
+                    if (--left) return;
+
+                    var all = [].concat.apply([], parts);
+                    // Несколько запросов (премьеры + свежие сезоны) — общий порядок по популярности
+                    if (opts.byPopularity) all.sort(function (a, b) { return (b.popularity || 0) - (a.popularity || 0); });
+                    cb(all, more);
                 });
+            });
+        }
+
+        return { page: page, load: firstRows(page) };
+    }
+
+    // Ряд на главной: первая страница, а если после фильтров осталось мало — добираем вторую
+    function firstRows(page) {
+        return function (cb) {
+            page(1, function (a, more) {
+                if (a.length >= 12 || !more) return cb(a);
+                page(2, function (b) { cb(a.concat(b)); });
             });
         };
     }
 
+    // Основная лента, а если в ней меньше 6 фильмов — запасная («Смотреть все» листает ту же, что в ряду)
+    function withSpare(main, spare) {
+        var use = main;
+
+        function page(n, cb) {
+            if (n > 1) return use.page(n, cb);
+            main.page(1, function (a, more) {
+                if (a.length >= 6) {
+                    use = main;
+                    return cb(a, more);
+                }
+                use = spare;
+                spare.page(1, cb);
+            });
+        }
+
+        return { page: page, load: firstRows(page) };
+    }
+
+    function tvQuery(params) {
+        var p = copy(params);
+        p.without_genres = TV_EXCLUDE;
+        return ['discover/tv', p];
+    }
+
     function discover(params) {
-        return source('discover/movie', params);
+        return feed([['discover/movie', params]]);
     }
 
     function discoverTv(params) {
-        var p = copy(params);
-        p.without_genres = TV_EXCLUDE;
-        return source('discover/tv', p);
+        return feed([tvQuery(params)]);
+    }
+
+    function row(title, f) {
+        return { title: title, load: f.load, page: f.page };
     }
 
     function dateShift(days) {
@@ -819,32 +931,26 @@
             spare: { with_genres: '18,10749', sort_by: 'popularity.desc', 'vote_count.gte': 500 }
         };
 
-        return {
-            title: s.title,
-            load: function (cb) {
-                tmdb('discover/movie', s.main, function (items) {
-                    items = clean(items);
-                    if (items.length >= 6) cb(items);
-                    else tmdb('discover/movie', s.spare, cb);
-                });
-            }
-        };
+        return row(s.title, withSpare(discover(s.main), discover(s.spare)));
     }
 
-    // Один ряд рекомендаций по последним 5 тайтлам из истории: списки перемешиваем по очереди
+    // Рекомендации по последним 5 тайтлам из истории: списки перемешиваем по очереди
     // (1-й от каждого, потом 2-й…), чтобы ряд не состоял из похожих на один фильм
-    function historyRecommendations(hist, seen) {
-        return function (cb) {
-            var srcs = hist.slice(0, 5);
-            var lists = [];
-            var pending = srcs.length;
+    function historyFeed(hist, seen) {
+        var srcs = hist.slice(0, 5);
 
-            if (!pending) return cb([]);
+        function page(n, cb) {
+            var lists = [];
+            var left = srcs.length;
+            var more = false;
+
+            if (!left) return cb([], false);
 
             srcs.forEach(function (card, i) {
-                tmdb((isTv(card) ? 'tv' : 'movie') + '/' + card.id + '/recommendations', {}, function (items) {
-                    lists[i] = clean(items).filter(function (m) { return !seen[m.id]; });
-                    if (--pending) return;
+                tmdbJson((isTv(card) ? 'tv' : 'movie') + '/' + card.id + '/recommendations', { page: n }, function (j) {
+                    lists[i] = clean((j && j.results) || []).filter(function (m) { return !seen[m.id]; });
+                    if (j && j.total_pages > n) more = true;
+                    if (--left) return;
 
                     var out = [];
                     var ids = {};
@@ -857,10 +963,12 @@
                             }
                         }
                     }
-                    cb(out);
+                    cb(out, more);
                 });
             });
-        };
+        }
+
+        return { page: page, load: function (cb) { page(1, function (a) { cb(a); }); } };
     }
 
     function buildCategories() {
@@ -876,97 +984,86 @@
         cats.push(personal('Продолжить просмотр', continueList));
 
         if (hist.length) {
-            cats.push({ title: 'На основе того, что вы смотрели', load: historyRecommendations(hist, seen) });
+            cats.push(row('На основе того, что вы смотрели', historyFeed(hist, seen)));
         }
 
         // --- Актуальное ---
-        cats.push({ title: 'Тренды недели: кино', load: source('trending/movie/week') });
-        cats.push({ title: 'Тренды недели: сериалы', load: source('trending/tv/week') });
-        cats.push({
-            title: 'Вышло в цифре недавно',
-            load: discover({
-                with_release_type: 4,
-                'release_date.gte': dateShift(-60),
-                'release_date.lte': dateShift(0),
-                sort_by: 'popularity.desc',
-                'vote_count.gte': 50,
-                'vote_average.gte': 6   // без провалов
-            })
-        });
+        cats.push(row('Тренды недели: кино', feed([['trending/movie/week']])));
+        cats.push(row('Тренды недели: сериалы', feed([['trending/tv/week']])));
+        cats.push(row('Вышло в цифре недавно', discover({
+            with_release_type: 4,
+            'release_date.gte': dateShift(-60),
+            'release_date.lte': dateShift(0),
+            sort_by: 'popularity.desc',
+            'vote_count.gte': 50,
+            'vote_average.gte': 6   // без провалов
+        })));
         // Серии ±7 дней. Без сериалов старше 6 лет («Закон и порядок», «Симпсоны» выходят каждую неделю
         // и забивали ряд), без ток-шоу/реалити и без малоизвестного (от 100 голосов)
-        cats.push({
-            title: 'Новые серии на этой неделе',
-            load: discoverTv({
-                'air_date.gte': dateShift(-7),
-                'air_date.lte': dateShift(7),
-                'first_air_date.gte': dateShift(-365 * 6),
-                'vote_count.gte': 100,
-                sort_by: 'popularity.desc'
-            })
-        });
-        cats.push({
-            title: 'Премьеры сериалов этого месяца',
-            // от 30 голосов — без никому не известных сериалов с рейтингом 9.0 от одного голоса
-            load: discoverTv({ 'first_air_date.gte': dateShift(-30), 'first_air_date.lte': dateShift(0), 'vote_count.gte': 30, sort_by: 'popularity.desc' })
-        });
+        cats.push(row('Новые серии на этой неделе', discoverTv({
+            'air_date.gte': dateShift(-7),
+            'air_date.lte': dateShift(7),
+            'first_air_date.gte': dateShift(-365 * 6),
+            'vote_count.gte': 100,
+            sort_by: 'popularity.desc'
+        })));
+        // от 30 голосов — без никому не известных сериалов с рейтингом 9.0 от одного голоса
+        cats.push(row('Премьеры сериалов этого месяца', discoverTv({
+            'first_air_date.gte': dateShift(-30), 'first_air_date.lte': dateShift(0), 'vote_count.gte': 30, sort_by: 'popularity.desc'
+        })));
         cats.push(seasonCategory());
 
-        // --- Платформы: только то, у чего выходили серии за последний год (а не классика 2000-х) ---
-        [['Новое на Netflix', 213], ['Новое на HBO', 49], ['Новое на Apple TV+', 2552]].forEach(function (p) {
-            cats.push({
-                title: p[0],
-                load: discoverTv({
+        // --- Платформы: премьеры за год + свежие сезоны (серии за последние 2 месяца) ---
+        // Раньше брали всё, у чего серии выходили за год, — и финал «Очень странных дел» годичной давности
+        // считался «новым». HBO — вместе с Max (3186): новые сериалы HBO выходят там.
+        [['Новое на Netflix', '213'], ['Новое на HBO', '49|3186'], ['Новое на Apple TV+', '2552']].forEach(function (p) {
+            cats.push(row(p[0], feed([
+                tvQuery({
                     with_networks: p[1],
-                    'air_date.gte': dateShift(-365),
+                    'first_air_date.gte': dateShift(-365),
+                    'first_air_date.lte': dateShift(0),
+                    'vote_count.gte': 30,
+                    'vote_average.gte': 6.8,
+                    sort_by: 'popularity.desc'
+                }),
+                tvQuery({
+                    with_networks: p[1],
+                    'air_date.gte': dateShift(-60),
                     'air_date.lte': dateShift(0),
-                    'vote_count.gte': 50,
-                    'vote_average.gte': 7.2,
+                    'vote_count.gte': 100,
+                    'vote_average.gte': 7,
                     sort_by: 'popularity.desc'
                 })
-            });
+            ], { byPopularity: true })));
         });
 
         // --- Формат и темы ---
-        cats.push({
-            title: 'Коротко на вечер: фильмы до 100 минут',
-            load: discover({ 'with_runtime.gte': 60, 'with_runtime.lte': 100, 'vote_average.gte': 6.5, 'vote_count.gte': 500, sort_by: 'popularity.desc' })
-        });
-        cats.push({ title: 'Мини-сериалы на выходные', load: discoverTv({ with_type: 2, sort_by: 'popularity.desc', 'vote_count.gte': 100 }) });
-        cats.push({
-            title: 'Основано на реальных событиях',
-            load: discover({ with_keywords: 9672, sort_by: 'popularity.desc', 'vote_count.gte': 300 })
-        });
+        cats.push(row('Коротко на вечер: фильмы до 100 минут', discover({
+            'with_runtime.gte': 60, 'with_runtime.lte': 100, 'vote_average.gte': 6.5, 'vote_count.gte': 500, sort_by: 'popularity.desc'
+        })));
+        cats.push(row('Мини-сериалы на выходные', discoverTv({ with_type: 2, sort_by: 'popularity.desc', 'vote_count.gte': 100 })));
+        cats.push(row('Основано на реальных событиях', discover({ with_keywords: 9672, sort_by: 'popularity.desc', 'vote_count.gte': 300 })));
 
-        cats.push({
-            title: 'Лучшее за ' + year + ' год',
-            load: function (cb) {
-                // от 500 голосов: у новинок с парой сотен голосов рейтинг завышен
-                tmdb('discover/movie', { primary_release_year: year, sort_by: 'vote_average.desc', 'vote_count.gte': 500 }, function (items) {
-                    items = clean(items);
-                    if (items.length >= 6) cb(items);
-                    else tmdb('discover/movie', { primary_release_year: year - 1, sort_by: 'vote_average.desc', 'vote_count.gte': 500 }, cb);
-                });
-            }
-        });
+        // от 500 голосов: у новинок с парой сотен голосов рейтинг завышен. В начале года — прошлый год
+        cats.push(row('Лучшее за ' + year + ' год', withSpare(
+            discover({ primary_release_year: year, sort_by: 'vote_average.desc', 'vote_count.gte': 500 }),
+            discover({ primary_release_year: year - 1, sort_by: 'vote_average.desc', 'vote_count.gte': 500 })
+        )));
         // Лучшие сериалы, вышедшие за 5 лет; от 1000 голосов — иначе лезут малоизвестные с накрученным рейтингом
-        cats.push({
-            title: 'Лучшие сериалы за 5 лет',
-            load: discoverTv({ 'first_air_date.gte': dateShift(-365 * 5), 'vote_count.gte': 1000, sort_by: 'vote_average.desc' })
-        });
-        cats.push({ title: 'Для всей семьи', load: discover({ with_genres: 10751, sort_by: 'popularity.desc', 'vote_count.gte': 300 }) });
+        cats.push(row('Лучшие сериалы за 5 лет', discoverTv({
+            'first_air_date.gte': dateShift(-365 * 5), 'vote_count.gte': 1000, sort_by: 'vote_average.desc'
+        })));
+        cats.push(row('Для всей семьи', discover({ with_genres: 10751, sort_by: 'popularity.desc', 'vote_count.gte': 300 })));
 
         // --- Классика ---
-        cats.push({
-            title: 'Хиты 90-х',
-            load: discover({ 'primary_release_date.gte': '1990-01-01', 'primary_release_date.lte': '1999-12-31', sort_by: 'vote_count.desc' })
-        });
-        cats.push({
-            title: 'Хиты 2000-х',
-            load: discover({ 'primary_release_date.gte': '2000-01-01', 'primary_release_date.lte': '2009-12-31', sort_by: 'vote_count.desc' })
-        });
+        cats.push(row('Хиты 90-х', discover({
+            'primary_release_date.gte': '1990-01-01', 'primary_release_date.lte': '1999-12-31', sort_by: 'vote_count.desc'
+        })));
+        cats.push(row('Хиты 2000-х', discover({
+            'primary_release_date.gte': '2000-01-01', 'primary_release_date.lte': '2009-12-31', sort_by: 'vote_count.desc'
+        })));
         // movie/top_rated поднимает новинки с завышенным ранним рейтингом — берём только от 5000 голосов
-        cats.push({ title: 'Лучшие фильмы всех времён', load: discover({ 'vote_count.gte': 5000, sort_by: 'vote_average.desc' }) });
+        cats.push(row('Лучшие фильмы всех времён', discover({ 'vote_count.gte': 5000, sort_by: 'vote_average.desc' })));
 
         cats.forEach(function (c) {
             c.items = null;
@@ -982,7 +1079,7 @@
     // Ряды хранятся на устройстве до 6 часов: при включении ТВ «Подборки» показываются сразу из кэша,
     // а если кэшу больше 30 минут — в фоне скачивается свежий вариант для следующего открытия.
 
-    var ROWS_KEY = 'rec_rows_cache_v2';   // v2: ряды, загруженные с page=1 (v1 мог хранить старые тренды)
+    var ROWS_KEY = 'rec_rows_cache_v3';   // v3: новые правила «Новое на…»; v1/v2 могли хранить старые ряды
     var ROWS_TTL = 6 * 3600 * 1000;
     var ROWS_REFRESH = 30 * 60 * 1000;
     var rowsCache = null;
@@ -1002,6 +1099,7 @@
         if (rowsCache) return rowsCache;
         try {
             window.localStorage.removeItem('rec_rows_cache_v1');
+            window.localStorage.removeItem('rec_rows_cache_v2');
         } catch (e) {}
         try {
             rowsCache = JSON.parse(window.localStorage.getItem(ROWS_KEY) || '{}') || {};
@@ -1088,7 +1186,7 @@
                     '<div class="rec-tv__head"><div class="rec-tv__title"></div><img class="rec-tv__logo" alt="" /></div>' +
                     '<div class="rec-tv__meta"></div>' +
                     '<div class="rec-tv__overview"></div>' +
-                    '<div class="rec-tv__hint">Нажмите на постер, чтобы смотреть</div>' +
+                    '<div class="rec-tv__hint">' + HINT_TEXT + '</div>' +
                 '</div>' +
                 '<div class="rec-tv__rows">' +
                     '<div class="rec-tv__prev selector"></div>' +
@@ -1228,6 +1326,7 @@
 
             heroItem = m;
             heroTime = Date.now();
+            root.find('.rec-tv__hint').text(HINT_TEXT);   // после плитки «Смотреть все» — снова про постер
             stopTrailer();
             heroEl.removeClass('rec-hidden');
 
@@ -1483,7 +1582,7 @@
 
             track.children('.rec-card').eq(i).remove();
             if (i < c.idx) c.idx--;
-            focusIdx(Math.min(c.idx, c.items.length - 1), true);
+            focusIdx(Math.min(c.idx, lastIdx(c)), true);
 
             refreshCollection();
         }
@@ -1494,7 +1593,7 @@
             var c = cats[cur];
             if (!c || !c.items || !c.items.length) return;
 
-            i = Math.max(0, Math.min(c.items.length - 1, i));
+            i = Math.max(0, Math.min(lastIdx(c), i));
             c.idx = i;
 
             var cards = track.children('.rec-card');
@@ -1508,7 +1607,8 @@
             var off = el[0].offsetLeft - cards[0].offsetLeft;
             track.css('transform', 'translate3d(' + (-off) + 'px,0,0)');
 
-            updateHero(c.items[i]);
+            if (i < c.items.length) updateHero(c.items[i]);
+            else updateHeroMore(c);
 
             if (!noSchedule) srcSchedule();
         }
@@ -1536,73 +1636,18 @@
             });
         }
 
-        // --- Запуск просмотра ---
-        // Showy RU перед открытием проверяет подписку на своём сервере (до 10 с, с повторами),
-        // и всё это время на экране ничего не происходит. Поэтому сразу показываем лоадер на постере
-        // и не пускаем повторные нажатия: каждое новое нажатие перезапускает проверку в Showy.
-
-        var HINT = 'Нажмите на постер, чтобы смотреть';
-        var LAUNCH_TIMEOUT = 25000;
-        var launching = null;
-
-        function noop() {}
+        // --- Запуск просмотра (лоадер на постере — общий с экраном «Смотреть все») ---
 
         function play(m) {
-            if (launching || !m) return;
-
+            if (!m || isLaunching()) return;
             stopTrailer();
 
             var c = cats[cur];
-            var el = track.children('.rec-card').eq(c ? c.idx : 0);
-            var ctx = { cancelled: false };
-            var name = watchName();
-
-            launching = { ctx: ctx, el: el };
-
-            el.addClass('rec-card--loading').find('.rec-card__img').append('<div class="rec-card__spin"></div>');
-            heroEl.addClass('rec-tv__hero--loading');
-            root.find('.rec-tv__hint').text('Открываем ' + name + '…');
-
-            // Пока ждём — пульт ничего не делает, «Назад» отменяет
-            Lampa.Controller.add('rec_launch', {
-                invisible: true,
-                toggle: noop,
-                left: noop, right: noop, up: noop, down: noop,
-                enter: noop, long: noop,
-                back: function () { endLaunch(true); }
+            launchWatch(m, {
+                el: track.children('.rec-card').eq(c ? c.idx : 0),
+                hint: root.find('.rec-tv__hint'),
+                box: heroEl
             });
-            Lampa.Controller.toggle('rec_launch');
-
-            // Плагин открыл свой экран или окно (например, авторизацию Showy) — лоадер больше не нужен
-            launching.poll = setInterval(function () {
-                if (Lampa.Controller.enabled().name !== 'rec_launch') endLaunch(false);
-            }, 250);
-
-            launching.timer = setTimeout(function () {
-                endLaunch(true);
-                Lampa.Noty.show(name + ' долго не отвечает — попробуйте ещё раз');
-            }, LAUNCH_TIMEOUT);
-
-            watch(m, ctx);
-        }
-
-        // restore: вернуть пульт на экран (отмена или таймаут)
-        function endLaunch(restore) {
-            var l = launching;
-            if (!l) return;
-            launching = null;
-
-            clearInterval(l.poll);
-            clearTimeout(l.timer);
-
-            l.el.removeClass('rec-card--loading').find('.rec-card__spin').remove();
-            heroEl.removeClass('rec-tv__hero--loading');
-            root.find('.rec-tv__hint').text(HINT);
-
-            if (restore) {
-                cancelWatch(l.ctx);
-                if (Lampa.Controller.enabled().name === 'rec_launch') Lampa.Controller.toggle('content');
-            }
         }
 
         function makeCard(m, c) {
@@ -1612,23 +1657,71 @@
 
             // Индекс ищем в момент события: карточки без источников могут быть убраны из ряда
             card.on('hover:focus hover:hover', function () {
-                if (launching) return;
+                if (isLaunching()) return;
                 var i = indexOfItem(m);
                 if (i >= 0 && cats[cur].idx !== i) focusIdx(i);
             });
             card.on('hover:enter', function () {
-                if (launching) return;
+                if (isLaunching()) return;
                 var i = indexOfItem(m);
                 if (i >= 0) focusIdx(i);
                 play(m);
             });
             card.on('hover:long', function () {
-                if (launching) return;
+                if (isLaunching()) return;
                 stopTrailer();
                 openCard(m);
             });
 
             return card;
+        }
+
+        // --- «Смотреть все»: плитка в конце ряда и экран-сетка со всей подборкой ---
+
+        // Последняя позиция в ряду: у подборок с пагинацией это плитка «Смотреть все»
+        function lastIdx(c) {
+            return c.items.length - (c.page ? 0 : 1);
+        }
+
+        function openAll(c) {
+            if (!c || !c.page || !c.items || isLaunching()) return;
+            stopTrailer();
+            Lampa.Activity.push({ url: '', title: c.title, component: COMPONENT_ALL, rec_title: c.title, page: 1 });
+        }
+
+        function makeMoreCard(c) {
+            var card = $(
+                '<div class="rec-card rec-card--more selector"><div class="rec-card__img"><div class="rec-card__more">' +
+                    '<div class="rec-card__more-ico">→</div><div class="rec-card__more-text">Смотреть все</div>' +
+                '</div></div></div>'
+            );
+
+            card.on('hover:focus hover:hover', function () {
+                if (isLaunching() || cats[cur] !== c) return;
+                if (c.idx !== c.items.length) focusIdx(c.items.length);
+            });
+            card.on('hover:enter hover:long', function () {
+                openAll(c);
+            });
+
+            return card;
+        }
+
+        // Шапка, пока выбрана плитка «Смотреть все»: название подборки вместо фильма
+        function updateHeroMore(c) {
+            if (heroItem === c) return;
+
+            heroItem = c;
+            stopTrailer();
+            clearTimeout(detailsTimer);
+            clearTimeout(waitTimer);
+
+            heroEl.removeClass('rec-hidden rec-tv__hero--logo rec-tv__hero--wait');
+            root.find('.rec-tv__genres').empty();
+            root.find('.rec-tv__title').text(c.title);
+            root.find('.rec-tv__meta').empty().append($('<span class="rec-tv__rate"></span>').text('Вся подборка'));
+            root.find('.rec-tv__overview').text('Откройте, чтобы посмотреть все фильмы и сериалы этой подборки — новые подгружаются при прокрутке.');
+            root.find('.rec-tv__hint').text('Нажмите, чтобы открыть всю подборку');
         }
 
         function animateRows(dir) {
@@ -1697,10 +1790,11 @@
             if (!c.personal) {
                 c.items = c.items.filter(function (m) { return srcGet(m) !== false; });
                 if (!c.items.length) return removeCat(c);
-                if (c.idx >= c.items.length) c.idx = c.items.length - 1;
+                if (c.idx > lastIdx(c)) c.idx = lastIdx(c);
             }
 
             c.items.forEach(function (m) { track.append(makeCard(m, c)); });
+            if (c.page) track.append(makeMoreCard(c));
             focusIdx(c.idx);
 
             if (_this.activity) _this.activity.loader(false);
@@ -1752,7 +1846,7 @@
                 },
                 right: function () {
                     var c = cats[cur];
-                    if (c && c.items && c.idx < c.items.length - 1) focusIdx(c.idx + 1);
+                    if (c && c.items && c.idx < lastIdx(c)) focusIdx(c.idx + 1);
                 },
                 up: function () {
                     if (cur > 0) return switchCat(-1);
@@ -1764,11 +1858,13 @@
                     switchCat(1);
                 },
                 enter: function () {
-                    play(current());
+                    var m = current();
+                    if (m) play(m);
+                    else openAll(cats[cur]);   // плитка «Смотреть все»
                 },
                 long: function () {
                     var m = current();
-                    if (!m) return;
+                    if (!m) return openAll(cats[cur]);
                     stopTrailer();
                     openCard(m);
                 },
@@ -1807,6 +1903,286 @@
             window.removeEventListener('message', onMessage);
             document.removeEventListener('visibilitychange', onVisibility);
             root.remove();
+        };
+    }
+
+    // ---------- Экран «Смотреть все» ----------
+    // Вся подборка сеткой с подгрузкой при прокрутке. Нажатие — смотреть (тот же лоадер, что на главной),
+    // долгое нажатие — карточка Lampa. Фильмы без источников в Showy затемняются, а не исчезают,
+    // чтобы сетка не прыгала под пультом.
+
+    function genreNames(m) {
+        var names = [];
+        if (m.genre_ids) {
+            m.genre_ids.forEach(function (id) { if (GENRES[id]) names.push(GENRES[id]); });
+        } else if (m.genres) {
+            m.genres.forEach(function (g) { if (g && (GENRES[g.id] || g.name)) names.push(GENRES[g.id] || g.name); });
+        }
+        return names;
+    }
+
+    function AllComponent(object) {
+        var _this = this;
+        var destroyed = false;
+        var cat = null;
+
+        var items = [];           // загруженные фильмы по порядку
+        var cards = [];           // их карточки
+        var ids = {};
+        var page = 0;
+        var more = true;
+        var busy = false;
+        var emptyPages = 0;
+
+        var last = null;          // карточка в фокусе — чтобы вернуть фокус после возврата
+        var focused = null;
+        var bgTimer;
+        var bgPath = '';
+
+        var html = $(
+            '<div class="rec-all">' +
+                '<div class="rec-all__info">' +
+                    '<div class="rec-all__cat"></div>' +
+                    '<div class="rec-all__title"></div>' +
+                    '<div class="rec-all__meta"></div>' +
+                    '<div class="rec-all__overview"></div>' +
+                    '<div class="rec-all__hint">' + HINT_TEXT + '</div>' +
+                '</div>' +
+            '</div>'
+        );
+        var info = html.find('.rec-all__info');
+        var body = $('<div class="rec-all__grid"></div>');
+        var scroll = new Lampa.Scroll({ mask: true, over: true, step: 300, end_ratio: 2 });
+
+        // Проверка источников: по 2 фильма одновременно, начиная с выбранного
+        var queue = [];
+        var running = 0;
+        var inflight = {};
+
+        function isActive() {
+            var a = Lampa.Activity.active();
+            return a && a.activity === _this.activity && Lampa.Controller.enabled().name === 'content';
+        }
+
+        function findCat() {
+            var list = buildCategories();
+            for (var i = 0; i < list.length; i++) {
+                if (list[i].title === object.rec_title && list[i].page) return list[i];
+            }
+            return null;
+        }
+
+        function showInfo(m) {
+            focused = m;
+
+            html.find('.rec-all__title').text(m.title || m.name || '');
+
+            var meta = html.find('.rec-all__meta').empty();
+            if (m.vote_average) meta.append($('<span class="rec-tv__rate"></span>').text('★ ' + (+m.vote_average).toFixed(1)));
+            if (yearOf(m)) meta.append($('<span></span>').text(yearOf(m)));
+            meta.append($('<span></span>').text(isTv(m) ? 'Сериал' : 'Фильм'));
+            genreNames(m).slice(0, 2).forEach(function (n) { meta.append($('<span></span>').text(n)); });
+
+            html.find('.rec-all__overview').text(m.overview || 'Описание пока не добавлено.');
+
+            // Фон Lampa — кадр выбранного фильма; с задержкой, чтобы при листании не грузить каждый
+            clearTimeout(bgTimer);
+            var path = m.backdrop_path || m.poster_path;
+            if (!path || path === bgPath || !Lampa.Background || !Lampa.Background.change) return;
+            bgTimer = setTimeout(function () {
+                bgPath = path;
+                loadImage(path, 'w1280', function (url) {
+                    if (!destroyed && focused === m) Lampa.Background.change(url);
+                });
+            }, 400);
+        }
+
+        function markNoSrc(card) {
+            if (card.hasClass('rec-card--nosrc')) return;
+            card.addClass('rec-card--nosrc').find('.rec-card__img').append('<div class="rec-card__nosrc">Нет источников</div>');
+        }
+
+        function makeGridCard(m) {
+            var card = $('<div class="rec-card selector"><div class="rec-card__img"><img /></div></div>');
+            setPoster(card.find('img')[0], m.poster_path);
+
+            card.on('hover:focus', function () {
+                if (isLaunching()) return;
+                last = card[0];
+                scroll.update(card, true);
+                showInfo(m);
+                // Ближе к концу — подгружаем следующую страницу заранее
+                if (items.indexOf(m) >= items.length - 14) loadNext();
+                srcSchedule();
+            });
+            card.on('hover:hover', function () {
+                if (!isLaunching()) showInfo(m);
+            });
+            card.on('hover:enter', function () {
+                if (isLaunching()) return;
+                launchWatch(m, { el: card, hint: html.find('.rec-all__hint'), box: info });
+            });
+            card.on('hover:long', function () {
+                if (!isLaunching()) openCard(m);
+            });
+
+            return card;
+        }
+
+        function showEmpty(text) {
+            _this.activity.loader(false);
+            body.empty().append($('<div class="rec-all__empty"></div>').text(text));
+        }
+
+        function loadNext() {
+            if (busy || !more || destroyed || !cat) return;
+            busy = true;
+            page++;
+
+            cat.page(page, function (list, hasMore) {
+                busy = false;
+                if (destroyed) return;
+                more = !!hasMore;
+
+                var added = [];
+                (list || []).forEach(function (m) {
+                    // Повторы и то, про что уже известно «источников нет», не показываем
+                    if (ids[m.id] || srcGet(m) === false) return;
+                    ids[m.id] = true;
+
+                    var card = makeGridCard(m);
+                    items.push(m);
+                    cards.push(card);
+                    added.push(card[0]);
+                    body.append(card);
+                });
+
+                emptyPages = added.length ? 0 : emptyPages + 1;
+
+                if (page === 1) {
+                    _this.activity.loader(false);
+                    if (!items.length && !more) return showEmpty('В этой подборке пока ничего нет');
+                    if (items.length) showInfo(items[0]);
+                    // Экран уже активен с пустой сеткой — обновляем коллекцию и ставим фокус на первый постер
+                    if (isActive()) Lampa.Controller.toggle('content');
+                } else if (added.length && isActive()) {
+                    Lampa.Controller.collectionAppend(added);
+                }
+
+                // Сетка ещё короткая или страница целиком ушла в фильтры — сразу следующая (но не бесконечно)
+                if (more && (items.length < 28 || (!added.length && emptyPages < 3))) loadNext();
+                else if (!items.length) showEmpty('В этой подборке пока ничего нет');
+
+                srcSchedule();
+            });
+        }
+
+        function srcSchedule() {
+            if (!srcEnabled()) {
+                queue = [];
+                return;
+            }
+
+            var start = focused ? Math.max(0, items.indexOf(focused)) : 0;
+            queue = items.slice(start).concat(items.slice(0, start)).filter(function (m) {
+                return srcGet(m) === null && !inflight[srcId(m)];
+            }).slice(0, 40);
+
+            pump();
+        }
+
+        function pump() {
+            while (running < 2 && queue.length && srcEnabled()) {
+                var m = queue.shift();
+                var id = srcId(m);
+                if (inflight[id] || srcGet(m) !== null) continue;
+
+                inflight[id] = true;
+                running++;
+
+                (function (m, id) {
+                    checkSources(m, function (ok) {
+                        running--;
+                        delete inflight[id];
+
+                        if (ok !== null) srcSet(m, ok);
+                        if (destroyed) return;
+
+                        var i = items.indexOf(m);
+                        if (ok === false && i >= 0) markNoSrc(cards[i]);
+
+                        pump();
+                    });
+                })(m, id);
+            }
+        }
+
+        this.create = function () {
+            this.activity.loader(true);
+
+            cat = findCat();
+            html.find('.rec-all__cat').text(object.rec_title || '');
+
+            scroll.minus(info);
+            scroll.onEnd = loadNext;
+            scroll.append(body[0]);
+            html.append(scroll.render(true));
+
+            if (!cat) showEmpty('Подборка не найдена — вернитесь на «Подборки»');
+            else loadNext();
+
+            return this.render();
+        };
+
+        this.start = function () {
+            if (Lampa.Activity.active() && Lampa.Activity.active().activity !== this.activity) return;
+
+            Lampa.Controller.add('content', {
+                toggle: function () {
+                    Lampa.Controller.collectionSet(scroll.render(true));
+                    Lampa.Controller.collectionFocus(last || false, scroll.render(true));
+                },
+                left: function () {
+                    if (Navigator.canmove('left')) Navigator.move('left');
+                    else Lampa.Controller.toggle('menu');
+                },
+                right: function () {
+                    if (Navigator.canmove('right')) Navigator.move('right');
+                },
+                up: function () {
+                    if (Navigator.canmove('up')) Navigator.move('up');
+                    else Lampa.Controller.toggle('head');
+                },
+                down: function () {
+                    if (Navigator.canmove('down')) Navigator.move('down');
+                    else loadNext();
+                },
+                back: function () {
+                    Lampa.Activity.backward();
+                }
+            });
+
+            Lampa.Controller.toggle('content');
+        };
+
+        this.render = function () {
+            return html;
+        };
+
+        this.pause = function () {
+            endLaunch(false);
+        };
+        this.stop = function () {
+            endLaunch(false);
+        };
+
+        this.destroy = function () {
+            destroyed = true;
+            queue = [];
+            clearTimeout(bgTimer);
+            endLaunch(false);
+            scroll.destroy();
+            html.remove();
         };
     }
 
@@ -1896,7 +2272,27 @@
                 'border:.28em solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;-webkit-animation:recSpin .8s linear infinite;animation:recSpin .8s linear infinite}' +
             '@-webkit-keyframes recSpin{to{-webkit-transform:rotate(360deg)}}' +
             '@keyframes recSpin{to{transform:rotate(360deg)}}' +
-            '.rec-tv__hero--loading .rec-tv__hint{opacity:.95}' +
+            '.rec-launching .rec-tv__hint,.rec-launching .rec-all__hint{opacity:.95}' +
+            // Плитка «Смотреть все» в конце ряда
+            '.rec-card--more .rec-card__img{background:rgba(255,255,255,.1)}' +
+            '.rec-card__more{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:0 .6em}' +
+            '.rec-card__more-ico{width:2.4em;height:2.4em;line-height:2.25em;border-radius:50%;border:.14em solid rgba(255,255,255,.75);font-size:1.1em;margin-bottom:.6em;box-sizing:border-box}' +
+            '.rec-card__more-text{font-size:.85em;font-weight:600;line-height:1.3}' +
+            '.rec-card--more.focus .rec-card__img{background:rgba(255,255,255,.2)}' +
+            // Экран «Смотреть все»: сверху выбранный фильм, ниже сетка постеров
+            '.rec-all__info{padding:1em 3em .3em;min-height:8.6em;box-sizing:border-box}' +
+            '.rec-all__cat{font-size:.85em;opacity:.55;margin-bottom:.3em}' +
+            '.rec-all__title{font-size:1.9em;font-weight:700;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+            '.rec-all__meta{display:flex;align-items:center;margin:.35em 0 .45em}' +
+            '.rec-all__meta span{margin-right:1em;opacity:.9}' +
+            '.rec-all__overview{line-height:1.4;opacity:.8;max-width:46em;min-height:2.8em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
+            '.rec-all__hint{font-size:.8em;opacity:.45;margin-top:.45em}' +
+            '.rec-all__grid{display:flex;flex-wrap:wrap;padding:1.2em 2em 3em 3em}' +
+            '.rec-all__grid .rec-card{width:8.4em;margin:0 1.3em 1.6em 0;transform-origin:center center}' +
+            '.rec-all__grid .rec-card.focus{transform:scale(1.1);margin-right:1.3em}' +
+            '.rec-all__empty{padding:4em 3em;opacity:.7;text-align:center}' +
+            '.rec-card--nosrc .rec-card__img img{opacity:.35 !important}' +
+            '.rec-card__nosrc{position:absolute;left:.4em;right:.4em;bottom:.4em;font-size:.6em;text-align:center;background:rgba(0,0,0,.7);border-radius:.3em;padding:.25em}' +
             '.rec-card.focus{transform:scale(1.22);margin-right:3em}' +
             '.rec-card.focus .rec-card__img{box-shadow:0 0 0 .18em #fff,0 .6em 1.5em rgba(0,0,0,.6)}' +
             '.rec-card--skeleton .rec-card__img{animation:recPulse 1.2s ease-in-out infinite}' +
@@ -2063,6 +2459,8 @@
     }
 
     try {
+        // Экран «Смотреть все» регистрируем сразу: Lampa может восстановить его из истории раньше init()
+        Lampa.Component.add(COMPONENT_ALL, AllComponent);
         setStartScreen();
     } catch (e) {
         console.log('[rec]', 'start screen error', e);
