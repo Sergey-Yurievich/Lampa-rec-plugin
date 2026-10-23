@@ -11,7 +11,7 @@
     var COMPONENT = 'rec_home';
     var COMPONENT_ALL = 'rec_all';   // экран «Смотреть все» — вся подборка сеткой
     var HINT_TEXT = 'Нажмите на постер, чтобы смотреть';
-    var VERSION = '6.2.0';
+    var VERSION = '6.3.0';
 
     var ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">' +
         '<rect x="3" y="4" width="18" height="4" rx="1" fill="currentColor"/>' +
@@ -2425,6 +2425,7 @@
             addStyles();
             Lampa.Component.add(COMPONENT, Component);
             Lampa.Listener.follow('full', onFullReady);
+            initLauncher();
             addSettings();
             addMenu();
             // Даём уже установленным плагинам зарегистрироваться (Showy делает это в течение ~3 с)
@@ -2458,9 +2459,104 @@
         window.start_deep_link = { url: '', title: 'Подборки', component: COMPONENT, page: 1 };
     }
 
+    // ---------- Лаунчер ru.homescreen.tv: просмотр из лаунчера и «Продолжить» ----------
+    // Лаунчер — единственная точка входа: он открывает Lampa сразу на экране rec_watch (intent continueWatch +
+    // lampaActivity), а после просмотра его возвращают обратно ссылкой homescreen://back. Lampa при этом остаётся в
+    // памяти, и следующий запуск быстрый. «Продолжить просмотр» публикуется каналом для главного экрана TV.
+
+    var COMPONENT_WATCH = 'rec_watch';
+    var launcherSession = false;
+
+    function backToLauncher() {
+        launcherSession = false;
+        try {
+            if (window.AndroidJS && AndroidJS.openBrowser) AndroidJS.openBrowser('homescreen://back');
+        } catch (e) {
+            console.log('[rec]', 'launcher back error', e);
+        }
+    }
+
+    function WatchComponent(object) {
+        var html = $('<div class="rec-watch"><div class="rec-watch__bg"></div><div class="rec-watch__body">' +
+            '<div class="rec-watch__title"></div><div class="rec-watch__status"><div class="rec-watch__spin"></div>' +
+            '<span>Ищем источник…</span></div></div></div>');
+        var m = object.card || {};
+        var started = false;
+
+        this.create = function () {
+            html.find('.rec-watch__title').text(m.title || m.name || '');
+            if (m.backdrop_path) loadImage(m.backdrop_path, 'w1280', function (url) {
+                html.find('.rec-watch__bg').css('background-image', 'url(' + url + ')');
+            });
+            return html;
+        };
+        this.render = function () { return html; };
+        this.start = function () {
+            Lampa.Controller.add(COMPONENT_WATCH, {
+                toggle: noop, left: noop, right: noop, up: noop, down: noop, enter: noop,
+                back: backToLauncher
+            });
+            Lampa.Controller.toggle(COMPONENT_WATCH);
+            // Вернулись сюда «Назад» с экрана источников — домой, в лаунчер
+            if (started) return backToLauncher();
+            started = true;
+            launcherSession = true;
+            watch(m, {});
+        };
+        this.pause = noop;
+        this.stop = noop;
+        this.destroy = function () { html.remove(); };
+    }
+
+    function launcherCss() {
+        $('head').append('<style>' +
+            '.rec-watch{position:fixed;inset:0;background:#050608;z-index:1}' +
+            '.rec-watch__bg{position:absolute;inset:0;background-size:cover;background-position:center;opacity:.55}' +
+            '.rec-watch__body{position:absolute;left:5%;top:38%}' +
+            '.rec-watch__title{font-size:4.5em;font-weight:800;text-transform:uppercase;color:#fff}' +
+            '.rec-watch__status{display:flex;align-items:center;gap:.8em;margin-top:.8em;font-size:1.6em;color:rgba(255,255,255,.85)}' +
+            '.rec-watch__spin{width:1.2em;height:1.2em;border-radius:50%;border:.18em solid rgba(255,255,255,.25);border-top-color:#fff;animation:rec-watch-spin .9s linear infinite}' +
+            '@keyframes rec-watch-spin{to{transform:rotate(360deg)}}' +
+            '</style>');
+    }
+
+    function publishContinue() {
+        if (!window.AndroidJS || !AndroidJS.publishPluginChannel) return;
+        try {
+            var items = continueList().slice(0, 20).map(function (c) {
+                var tv = isTv(c);
+                return {
+                    id: c.id, type: tv ? 'tv' : 'movie', source: 'tmdb',
+                    title: c.title || c.name, name: tv ? (c.name || c.title) : undefined,
+                    original_title: c.original_title || c.original_name, overview: c.overview || '',
+                    poster_path: c.poster_path || undefined, backdrop_path: c.backdrop_path || undefined,
+                    img: c.poster_path ? 'https://imagetmdb.com/t/p/w342' + c.poster_path : undefined,
+                    background_image: c.backdrop_path ? 'https://imagetmdb.com/t/p/w780' + c.backdrop_path : undefined,
+                    vote_average: typeof c.vote_average === 'number' ? c.vote_average : undefined,
+                    release_year: String(yearOf(c) || '') || undefined
+                };
+            });
+            AndroidJS.publishPluginChannel(JSON.stringify({ id: 'rec.continue', title: 'Продолжить просмотр', items: items }));
+        } catch (e) {
+            console.log('[rec]', 'publish continue error', e);
+        }
+    }
+
+    function initLauncher() {
+        launcherCss();
+        publishContinue();
+        if (Lampa.Player && Lampa.Player.listener) Lampa.Player.listener.follow('destroy', function () {
+            // Позиция в истории сохраняется не сразу — публикуем чуть позже
+            setTimeout(publishContinue, 3000);
+            if (launcherSession) setTimeout(backToLauncher, 300);
+        });
+    }
+
     try {
         // Экран «Смотреть все» регистрируем сразу: Lampa может восстановить его из истории раньше init()
         Lampa.Component.add(COMPONENT_ALL, AllComponent);
+        // Экран просмотра из лаунчера: Lampa может открыть его по ссылке раньше init()
+        Lampa.Component.add(COMPONENT_WATCH, WatchComponent);
         setStartScreen();
     } catch (e) {
         console.log('[rec]', 'start screen error', e);
